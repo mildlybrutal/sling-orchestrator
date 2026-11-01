@@ -242,10 +242,12 @@ func pipeline(d *Deployment) error {
 		return fmt.Errorf("cutover failed (traffic unchanged): %w", err)
 	}
 
-	// Verify through the proxy, the path real users take. This catches what
-	// the direct check can't: Caddy unable to reach the container on sling-net.
+	// Verify through the proxy, the path real users take, and require that
+	// the NEW container answered (Caddy reports which upstream did). This
+	// catches what the direct check can't: Caddy unable to reach the
+	// container on sling-net, or still routing to the old one.
 	fmt.Printf("Verifying through the proxy (%s)...\n", proxyPublicURL)
-	if err := waitHealthy(ctx, postCutoverHealth, proxyPublicURL+"/health", isRunning); err != nil {
+	if err := waitUntil(ctx, postCutoverHealth, proxyPublicURL+"/health", servedBy(upstream), isRunning); err != nil {
 		rbErr := setUpstream(ctx, prev)
 		if rbErr != nil {
 			return fmt.Errorf("post-cutover check failed (%v) AND rollback failed (%v): the proxy may be pointing at a container that is about to be removed",

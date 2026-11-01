@@ -124,3 +124,41 @@ func TestStatusHistoryOrder(t *testing.T) {
 		t.Fatalf("unexpected history: %v %v", s, h)
 	}
 }
+
+// upstreamServer answers 200 and claims to be served by the given upstream,
+// the way Caddy reports it.
+func upstreamServer(upstream string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if upstream != "" {
+			w.Header().Set(upstreamHeader, upstream)
+		}
+		w.WriteHeader(200)
+	}))
+}
+
+func TestServedByNewUpstreamPasses(t *testing.T) {
+	srv := upstreamServer("app-new:3000")
+	defer srv.Close()
+	if err := waitUntil(context.Background(), fastCfg, srv.URL, servedBy("app-new:3000"), alwaysRunning); err != nil {
+		t.Fatalf("expected pass, got %v", err)
+	}
+}
+
+func TestServedByOldUpstreamFails(t *testing.T) {
+	// Healthy, but still the old version answering: must NOT pass.
+	srv := upstreamServer("app-old:3000")
+	defer srv.Close()
+	err := waitUntil(context.Background(), fastCfg, srv.URL, servedBy("app-new:3000"), alwaysRunning)
+	if err == nil || !strings.Contains(err.Error(), `served by "app-old:3000"`) {
+		t.Fatalf("expected wrong-upstream failure naming the old one, got %v", err)
+	}
+}
+
+func TestServedByMissingHeaderFails(t *testing.T) {
+	// No header at all (e.g. the proxy config lost it): fail, don't assume.
+	srv := upstreamServer("")
+	defer srv.Close()
+	if err := waitUntil(context.Background(), fastCfg, srv.URL, servedBy("app-new:3000"), alwaysRunning); err == nil {
+		t.Fatal("a response without the upstream header must not pass")
+	}
+}

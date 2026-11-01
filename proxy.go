@@ -54,6 +54,13 @@ func buildCaddyConfig(upstream string) ([]byte, error) {
 		handler = map[string]any{
 			"handler":   "reverse_proxy",
 			"upstreams": []any{map[string]any{"dial": upstream}},
+			"headers": map[string]any{
+				"response": map[string]any{
+					"set": map[string][]string{
+						upstreamHeader: {"{http.reverse_proxy.upstream.hostport}"},
+					},
+				},
+			},
 		}
 	}
 
@@ -207,3 +214,8 @@ func waitForAdmin(ctx context.Context, limit time.Duration) error {
 		}
 	}
 }
+
+// Caddy stamps every proxied response with the upstream that answered it,
+// so Sling can tell which version served a request without relying on
+// anything inside the app.
+const upstreamHeader = "X-Sling-Upstream"
