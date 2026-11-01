@@ -9,11 +9,13 @@ type Status string
 
 const (
 	StatusQueued         Status = "queued"
+	StatusPreparing      Status = "preparing" // network + proxy container ready
 	StatusCloning        Status = "cloning"
 	StatusBuilding       Status = "building"
 	StatusStarting       Status = "starting"
 	StatusHealthChecking Status = "health_checking"
-	StatusHealthy        Status = "healthy" // passed checks, not yet receiving traffic (phase 4 adds "live")
+	StatusHealthy        Status = "healthy"   // passed checks, not yet receiving traffic
+	StatusSwitching      Status = "switching" // proxy being pointed at the new version
 	StatusFailed         Status = "failed"
 	StatusLive           Status = "live"
 	StatusRolledBack     Status = "rolled_back"

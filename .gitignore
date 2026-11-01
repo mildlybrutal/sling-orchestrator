@@ -1,2 +1,7 @@
 /scripts
-orchestrator
+/orchestrator
+
+
+
+*.orig
+*.rej

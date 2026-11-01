@@ -22,6 +22,10 @@ type Deployment struct {
 	ContainerID string
 	HostPort    string
 
+	// PreviousUpstream is what the proxy served before this deploy
+	// ("app-<sha>:3000"), or "" if nothing was live. Phase 5 retires it.
+	PreviousUpstream string
+
 	// Status tracking (see status.go). Guarded by mu because the dashboard
 	// API will read these while the pipeline goroutine writes them.
 	mu      sync.Mutex
@@ -45,6 +49,10 @@ var (
 	shaPattern         = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	containerIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	allowedRepoHosts   = map[string]bool{"github.com": true}
+
+	// One deploy at a time. There is a single app for now; the webhook
+	// phase turns this into a per-app lock.
+	deployMu sync.Mutex
 )
 
 func main() {
@@ -62,9 +70,13 @@ func main() {
 		log.Fatalf("Deployment failed: %v", err)
 	}
 
-	fmt.Printf("\n✅ Deployed and healthy (not yet routed: phase 4)\n")
+	fmt.Printf("\n✅ Live\n")
 	fmt.Printf("   Container ID : %s\n", deploy.ContainerID[:12])
-	fmt.Printf("   URL          : http://127.0.0.1:%s\n", deploy.HostPort)
+	fmt.Printf("   Public URL   : %s\n", proxyPublicURL)
+	fmt.Printf("   Direct URL   : http://127.0.0.1:%s (bypasses the proxy)\n", deploy.HostPort)
+	if deploy.PreviousUpstream != "" {
+		fmt.Printf("   Previous     : %s (still running; phase 5 retires it)\n", deploy.PreviousUpstream)
+	}
 	deploy.printTimeline()
 }
 
@@ -89,11 +101,18 @@ func validateRepoURL(raw string) error {
 }
 
 // runPipeline wraps pipeline so that any failure, from any stage, is
-// recorded as StatusFailed in one place.
+// recorded in one place. A deploy that was rolled back keeps that status
+// instead of being overwritten with plain "failed".
 func runPipeline(d *Deployment) error {
 	d.setStatus(StatusQueued)
+
+	deployMu.Lock()
+	defer deployMu.Unlock()
+
 	if err := pipeline(d); err != nil {
-		d.setStatus(StatusFailed)
+		if s, _ := d.Snapshot(); s != StatusRolledBack {
+			d.setStatus(StatusFailed)
+		}
 		return err
 	}
 	return nil
@@ -106,6 +125,15 @@ func pipeline(d *Deployment) error {
 	}
 	if err := validateRepoURL(d.RepoURL); err != nil {
 		return err
+	}
+
+	ctx := context.Background()
+
+	// Fail fast if Docker or the proxy is broken, before spending time on a
+	// build. This also creates sling-net, which the app container joins.
+	d.setStatus(StatusPreparing)
+	if err := ensureProxy(ctx); err != nil {
+		return fmt.Errorf("proxy setup failed: %w", err)
 	}
 
 	buildDir := filepath.Join(os.TempDir(), "paas-builds", d.CommitSHA)
@@ -152,7 +180,10 @@ func pipeline(d *Deployment) error {
 
 	out, err := runCaptureCmd(dockerTimeout, "", "docker", "run", "-d",
 		"--name", containerName,
-		"-p", "127.0.0.1::3000", // random host port, loopback only
+		"--network", networkName, // Caddy reaches the app by this name
+		"--label", "sling.managed=true",
+		"--label", "sling.sha="+d.CommitSHA,
+		"-p", "127.0.0.1::"+appPort, // loopback only: Sling's own health checks
 		"--memory", "256m",
 		"--cpus", "0.5",
 		"-e", fmt.Sprintf("APP_VERSION=%s", d.CommitSHA),
@@ -166,9 +197,12 @@ func pipeline(d *Deployment) error {
 	}
 	d.ContainerID = out
 
-	portOut, err := runCaptureCmd(dockerTimeout, "", "docker", "port", d.ContainerID, "3000/tcp")
+	portOut, err := runCaptureCmd(dockerTimeout, "", "docker", "port", d.ContainerID, appPort+"/tcp")
 	if err != nil {
-		return fmt.Errorf("failed to inspect port: %w", err)
+		// A container that dies instantly has no published port, so this is
+		// often the first symptom of a crash on boot. Show why.
+		return fmt.Errorf("failed to inspect port (container may have exited): %w\n--- last container logs ---\n%s",
+			err, containerLogs(d.ContainerID, 30))
 	}
 
 	firstLine := strings.Split(portOut, "\n")[0]
@@ -185,12 +219,43 @@ func pipeline(d *Deployment) error {
 	fmt.Printf("Waiting for %s to pass health checks...\n", healthURL)
 
 	isRunning := func() (bool, error) { return containerRunning(d.ContainerID) }
-	if err := waitHealthy(context.Background(), defaultHealthConfig, healthURL, isRunning); err != nil {
+	if err := waitHealthy(ctx, defaultHealthConfig, healthURL, isRunning); err != nil {
 		return fmt.Errorf("health check failed: %w\n--- last container logs ---\n%s",
 			err, containerLogs(d.ContainerID, 30))
 	}
 
 	d.setStatus(StatusHealthy)
+
+	// Cutover. The proxy keeps serving the previous version until Caddy
+	// has applied the new config, then starts sending requests to the new one.
+	upstream := fmt.Sprintf("%s:%s", containerName, appPort)
+
+	prev, err := currentUpstream(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read current upstream: %w", err)
+	}
+	d.PreviousUpstream = prev
+
+	d.setStatus(StatusSwitching)
+	fmt.Printf("Switching traffic: %q -> %q\n", prev, upstream)
+	if err := setUpstream(ctx, upstream); err != nil {
+		return fmt.Errorf("cutover failed (traffic unchanged): %w", err)
+	}
+
+	// Verify through the proxy, the path real users take. This catches what
+	// the direct check can't: Caddy unable to reach the container on sling-net.
+	fmt.Printf("Verifying through the proxy (%s)...\n", proxyPublicURL)
+	if err := waitHealthy(ctx, postCutoverHealth, proxyPublicURL+"/health", isRunning); err != nil {
+		rbErr := setUpstream(ctx, prev)
+		if rbErr != nil {
+			return fmt.Errorf("post-cutover check failed (%v) AND rollback failed (%v): the proxy may be pointing at a container that is about to be removed",
+				err, rbErr)
+		}
+		d.setStatus(StatusRolledBack)
+		return fmt.Errorf("post-cutover check failed, traffic restored to %q: %w", prev, err)
+	}
+
+	d.setStatus(StatusLive)
 	succeeded = true
 	return nil
 }
