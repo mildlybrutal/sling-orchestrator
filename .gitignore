@@ -1,7 +1,7 @@
-/scripts
 /orchestrator
-
-
+/sling
 
 *.orig
 *.rej
+.env.local
+.env

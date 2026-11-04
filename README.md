@@ -41,7 +41,9 @@ VPS that you own.
 | **Old connections finish cleanly** | The previous version is stopped with `docker stop` (SIGTERM, 10s to finish), not killed, and is kept so a manual rollback is just start + switch. |
 | **Resource limits** | Each app gets 256 MB of memory and 0.5 CPU, and its port is reachable only from the server itself (loopback). |
 | **One deploy at a time** | A lock stops two deploys from fighting over the proxy. |
-| **Live commit is not redeployed** | Redeploying the commit that is already live is refused before any container is touched. |
+| **Live commit is not redeployed** | Redeploying the commit that is already live is skipped before any container is touched. |
+| **Only signed pushes deploy** | Webhook deliveries must carry a valid HMAC-SHA256 signature, and come from the configured repo and branch. The clone URL comes from Sling's own config, never from the payload. |
+| **Bursts of pushes don't pile up** | Deploys run one at a time with at most one waiting. A newer push replaces the waiting one. |
 
 ## Who it is for
 
@@ -69,9 +71,10 @@ not the one with the most features.
 ```mermaid
 flowchart LR
     dev([Developer]) -->|"sling {repo} {sha}"| sling
+    gh([GitHub push webhook]) -->|"POST /webhook<br/>signed with HMAC"| sling
 
     subgraph host["Single host"]
-        sling["Sling orchestrator<br/>(Go CLI)"]
+        sling["Sling orchestrator<br/>(CLI or sling serve)"]
 
         subgraph docker["Docker"]
             subgraph net["sling-net (bridge network)"]
@@ -103,6 +106,10 @@ flowchart LR
 
 - **Orchestrator** (`main.go`): runs the deploy pipeline from start to finish and
   records each status change.
+- **Webhook server** (`serve.go`, `webhook.go`): `sling serve` checks each GitHub
+  push delivery and hands the commit to the deploy queue.
+- **Deploy queue** (`queue.go`): one worker, one waiting slot. The latest push wins,
+  and a deploy that is running always finishes, even during shutdown.
 - **Proxy control** (`proxy.go`): makes sure `sling-net` and the `sling-caddy`
   container exist. It builds the Caddy JSON config and swaps the upstream
   in one step through the admin API.
@@ -112,6 +119,31 @@ flowchart LR
   timeline, ready for the planned dashboard API.
 
 ## Low-level design (LLD)
+
+### Webhook flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub
+    participant H as webhookHandler
+    participant Q as deployQueue
+    participant W as worker
+    participant P as runPipeline
+    GH->>H: POST /webhook (X-Hub-Signature-256, X-GitHub-Event)
+    H->>H: POST only, body ≤ 5 MB
+    H->>H: HMAC-SHA256 over the raw body (constant-time compare)
+    alt bad or missing signature
+        H-->>GH: 401
+    end
+    H->>H: event: ping → 200 pong, other events → 200 ignored
+    H->>H: repo == SLING_REPO (else 403), ref == refs/heads/SLING_BRANCH,<br/>not deleted, after is 40 hex
+    H->>Q: submit(Deployment{cloneURL from config, sha})
+    Note over Q: same sha already waiting → dropped<br/>another one waiting → marked superseded
+    H-->>GH: 202 queued (GitHub gives up after 10 s)
+    W->>Q: take()
+    W->>P: run the deploy (no local repos allowed)
+```
 
 ### Deploy sequence
 
@@ -165,6 +197,8 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> queued
     queued --> preparing: deployMu acquired
+    queued --> superseded: newer push replaced it
+    preparing --> skipped: commit already live
     preparing --> cloning
     cloning --> building
     building --> starting
@@ -267,7 +301,37 @@ go run . ../sling $(git -C ../sling rev-parse HEAD)
 ```
 
 A successful run ends with the live container, URLs, the previous version's
-state and a timeline of each stage.
+state and a timeline of each stage. Deploying the commit that is already live
+prints "Nothing to do" and exits 0.
+
+### Deploy on `git push` (webhook server)
+
+```bash
+export SLING_WEBHOOK_SECRET=$(openssl rand -hex 32)   # required, at least 16 chars
+export SLING_REPO=you/app                              # required, owner/name
+export SLING_BRANCH=main                               # default: main
+export SLING_LISTEN=127.0.0.1:9000                     # default: 127.0.0.1:9000
+go run . serve
+```
+
+In the GitHub repo, go to **Settings → Webhooks → Add webhook** and set:
+- **Payload URL:** `https://<your-host>/webhook`
+- **Content type:** `application/json`
+- **Secret:** the same `SLING_WEBHOOK_SECRET`
+- **Events:** just the push event
+
+The default listen address is loopback, so GitHub can't reach it directly. Put
+a tunnel (cloudflared, ngrok) or a public HTTPS reverse proxy in front of it.
+
+Webhook deploys always clone `https://github.com/$SLING_REPO.git`; local paths
+are only accepted from the CLI. The first Ctrl-C (or SIGTERM) stops accepting
+webhooks and lets the deploy in progress finish. A second Ctrl-C forces an exit.
+
+To test without GitHub, send a signed push yourself:
+
+```bash
+SLING_WEBHOOK_SECRET=... ./scripts/send-webhook.sh you/app <40-char-sha> [branch] [url]
+```
 
 The sample app in [`../sling`](../sling) includes `make-cases.sh`, which creates
 commits that fail on purpose (`crash`, `bad-health`, `slow-start`) plus two
@@ -276,8 +340,9 @@ good versions, to exercise every path above.
 ## Testing
 
 ```bash
-go test ./...                                              # unit tests
+go test -race ./...                                        # unit tests (webhook, queue, health, prune)
 CADDY=/path/to/caddy go test -tags integration ./...       # against a real Caddy binary
+./scripts/run-cases.sh ../sling                            # end to end: deploys every demo case with Docker
 ```
 
 ## Roadmap
@@ -286,8 +351,9 @@ CADDY=/path/to/caddy go test -tags integration ./...       # against a real Cadd
 - [x] Health gate before any traffic is routed
 - [x] Caddy blue/green switch with a check that the new version answers
 - [x] Grace window with automatic rollback, and stopping the old version cleanly
-- [ ] Webhook server (deploy on `git push`), with local repo paths turned off
+- [x] Webhook server (deploy on `git push`): signed deliveries, a queue where the latest push wins, clean shutdown
 - [ ] Multiple apps with a lock per app and routing per domain
 - [ ] Dashboard and status API (the `Snapshot()` API is already in place)
 - [ ] TLS through Caddy's automatic HTTPS
-- [ ] Cleanup of old images and stopped containers, and a `sling rollback` command
+- [x] Cleanup of old containers, images and build folders
+- [ ] A `sling rollback` command

@@ -16,10 +16,12 @@ const (
 	StatusHealthChecking Status = "health_checking"
 	StatusHealthy        Status = "healthy"   // passed checks, not yet receiving traffic
 	StatusSwitching      Status = "switching" // proxy being pointed at the new version
-	StatusObserving      Status = "observing"
+	StatusObserving      Status = "observing" // new version serving, old one kept for rollback
 	StatusFailed         Status = "failed"
 	StatusLive           Status = "live"
 	StatusRolledBack     Status = "rolled_back"
+	StatusSuperseded     Status = "superseded" // a newer push replaced it before it started
+	StatusSkipped        Status = "skipped"    // that commit was already live
 )
 
 type StatusChange struct {

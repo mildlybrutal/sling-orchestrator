@@ -16,8 +16,13 @@ import (
 )
 
 type Deployment struct {
-	RepoURL     string
-	CommitSHA   string
+	RepoURL   string
+	CommitSHA string
+
+	// AllowLocalRepo lets RepoURL be a local path like ../sling. Only the CLI
+	// sets it; webhook deploys always clone from GitHub.
+	AllowLocalRepo bool
+
 	ImageTag    string
 	ContainerID string
 	HostPort    string
@@ -46,11 +51,11 @@ const (
 	// back if graceMaxFailures proxy probes in a row fail.
 	graceWindow      = 30 * time.Second
 	graceMaxFailures = 3
-
-	// Dev only: lets RepoURL be a local path like ../sling. Turn off before
-	// the webhook server accepts input from the network.
-	allowLocalRepos = true
 )
+
+// errAlreadyLive means the requested commit is already serving traffic, so
+// there is nothing to do. Callers treat it as "skipped", not as a failure.
+var errAlreadyLive = errors.New("commit is already live")
 
 var (
 	shaPattern         = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -67,16 +72,28 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "serve" {
+		if err := serve(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) != 3 {
-		log.Fatalf("usage: %s <repo-url-or-path> <40-char-commit-sha>", os.Args[0])
+		log.Fatalf("usage:\n  %[1]s <repo-url-or-path> <40-char-commit-sha>   deploy one commit\n  %[1]s serve                                     run the webhook server", os.Args[0])
 	}
 
 	deploy := &Deployment{
-		RepoURL:   os.Args[1],
-		CommitSHA: os.Args[2],
+		RepoURL:        os.Args[1],
+		CommitSHA:      os.Args[2],
+		AllowLocalRepo: true, // the person at the terminal already has the files
 	}
 
-	if err := runPipeline(deploy); err != nil {
+	err := runPipeline(deploy)
+	if errors.Is(err, errAlreadyLive) {
+		fmt.Printf("Nothing to do: %s is already live at %s\n", deploy.CommitSHA[:7], proxyPublicURL)
+		return
+	}
+	if err != nil {
 		deploy.printTimeline()
 		log.Fatalf("Deployment failed: %v", err)
 	}
@@ -91,11 +108,13 @@ func main() {
 	deploy.printTimeline()
 }
 
-func validateRepoURL(raw string) error {
+// validateRepoURL accepts an https URL on an allowed host, or, only when
+// allowLocal is set (CLI deploys), a local path.
+func validateRepoURL(raw string, allowLocal bool) error {
 	if raw == "" || strings.HasPrefix(raw, "-") {
 		return fmt.Errorf("invalid repo URL %q", raw)
 	}
-	if allowLocalRepos && !strings.Contains(raw, "://") {
+	if allowLocal && !strings.Contains(raw, "://") {
 		return nil
 	}
 	u, err := url.Parse(raw)
@@ -113,7 +132,8 @@ func validateRepoURL(raw string) error {
 
 // runPipeline wraps pipeline so that any failure, from any stage, is
 // recorded in one place. A deploy that was rolled back keeps that status
-// instead of being overwritten with plain "failed".
+// instead of being overwritten with plain "failed", and one whose commit was
+// already live is "skipped".
 func runPipeline(d *Deployment) error {
 	d.setStatus(StatusQueued)
 
@@ -121,7 +141,10 @@ func runPipeline(d *Deployment) error {
 	defer deployMu.Unlock()
 
 	if err := pipeline(d); err != nil {
-		if s, _ := d.Snapshot(); s != StatusRolledBack {
+		switch s, _ := d.Snapshot(); {
+		case errors.Is(err, errAlreadyLive):
+			d.setStatus(StatusSkipped)
+		case s != StatusRolledBack:
 			d.setStatus(StatusFailed)
 		}
 		return err
@@ -134,7 +157,7 @@ func pipeline(d *Deployment) error {
 	if !shaPattern.MatchString(d.CommitSHA) {
 		return fmt.Errorf("invalid commit SHA %q: must be 40 lowercase hex characters", d.CommitSHA)
 	}
-	if err := validateRepoURL(d.RepoURL); err != nil {
+	if err := validateRepoURL(d.RepoURL, d.AllowLocalRepo); err != nil {
 		return err
 	}
 
@@ -159,7 +182,7 @@ func pipeline(d *Deployment) error {
 		return fmt.Errorf("could not read current upstream: %w", err)
 	}
 	if prev == upstream {
-		return fmt.Errorf("commit %s is already live", d.CommitSHA)
+		return fmt.Errorf("%s: %w", d.CommitSHA, errAlreadyLive)
 	}
 	d.PreviousUpstream = prev
 
