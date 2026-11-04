@@ -162,3 +162,93 @@ func TestServedByMissingHeaderFails(t *testing.T) {
 		t.Fatal("a response without the upstream header must not pass")
 	}
 }
+
+func TestWatchHoldsForFullDuration(t *testing.T) {
+	srv := upstreamServer("app-new:3000")
+	defer srv.Close()
+	start := time.Now()
+	err := watch(context.Background(), fastCfg, srv.URL, servedBy("app-new:3000"), alwaysRunning, 100*time.Millisecond, 3)
+	if err != nil {
+		t.Fatalf("expected pass, got %v", err)
+	}
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatal("returned before the window ended")
+	}
+}
+
+func TestWatchFailsOnConsecutiveFailures(t *testing.T) {
+	srv, _ := scripted(500)
+	defer srv.Close()
+	start := time.Now()
+	err := watch(context.Background(), fastCfg, srv.URL, is200, alwaysRunning, time.Second, 3)
+	if err == nil || !strings.Contains(err.Error(), "3 probes in a row") {
+		t.Fatalf("expected 3-in-a-row failure, got %v", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatal("should fail as soon as 3 probes fail, not wait out the window")
+	}
+}
+
+func TestWatchToleratesABlip(t *testing.T) {
+	// Two failures, then healthy again: below the limit, so it holds.
+	srv, _ := scripted(500, 500, 200)
+	defer srv.Close()
+	if err := watch(context.Background(), fastCfg, srv.URL, is200, alwaysRunning, 100*time.Millisecond, 3); err != nil {
+		t.Fatalf("a blip below the limit must not fail, got %v", err)
+	}
+}
+
+func TestWatchFailuresMustBeConsecutive(t *testing.T) {
+	// 4 failures in total but never 3 in a row: still holds.
+	srv, _ := scripted(500, 500, 200, 500, 500, 200)
+	defer srv.Close()
+	if err := watch(context.Background(), fastCfg, srv.URL, is200, alwaysRunning, 100*time.Millisecond, 3); err != nil {
+		t.Fatalf("non-consecutive failures must not fail, got %v", err)
+	}
+}
+
+func TestWatchFailsFastWhenContainerExits(t *testing.T) {
+	srv := upstreamServer("app-new:3000")
+	defer srv.Close()
+	start := time.Now()
+	err := watch(context.Background(), fastCfg, srv.URL, servedBy("app-new:3000"),
+		func() (bool, error) { return false, nil }, time.Second, 3)
+	if err == nil || !strings.Contains(err.Error(), "exited") {
+		t.Fatalf("expected exited error, got %v", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatal("should fail at once, not after 3 probes or the window")
+	}
+}
+
+func TestWatchCallerCancelIsAnError(t *testing.T) {
+	srv := upstreamServer("app-new:3000")
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := watch(ctx, fastCfg, srv.URL, servedBy("app-new:3000"), alwaysRunning, time.Second, 3); err == nil {
+		t.Fatal("a cancelled caller must not be reported as a healthy watch")
+	}
+}
+
+func TestPreviousContainer(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	cur := "app-" + strings.Repeat("b", 40) + ":3000"
+	cases := []struct {
+		prev, want string
+		ok         bool
+	}{
+		{"", "", false},  // first deploy
+		{cur, "", false}, // same version redeployed
+		{"app-" + sha + ":3000", "app-" + sha, true},
+		{"app-" + sha + ":9999", "", false}, // not our port
+		{"evil; rm -rf /:3000", "", false},  // never reaches docker
+		{"app-" + sha[:39] + ":3000", "", false},
+	}
+	for _, c := range cases {
+		got, ok := previousContainer(c.prev, cur)
+		if got != c.want || ok != c.ok {
+			t.Errorf("previousContainer(%q) = %q, %v; want %q, %v", c.prev, got, ok, c.want, c.ok)
+		}
+	}
+}

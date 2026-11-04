@@ -118,6 +118,63 @@ func waitUntil(ctx context.Context, cfg healthConfig, url string, pass check, is
 	}
 }
 
+func watch(ctx context.Context, cfg healthConfig, url string, pass check, isRunning func() (bool, error), duration time.Duration, maxFailures int) error {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+
+	client := newProbeClient(cfg)
+	ticker := time.NewTicker(cfg.Interval)
+
+	defer ticker.Stop()
+
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return parent.Err()
+		case <-ticker.C:
+		}
+		running, err := isRunning()
+		if err != nil {
+			return fmt.Errorf("could not check container state: %w", err)
+		}
+		if !running {
+			return fmt.Errorf("container exited during the %v watch", duration)
+		}
+
+		res, err := probe(ctx, client, url)
+		if ctx.Err() != nil {
+			return parent.Err()
+		}
+
+		var ok bool
+		var problem string
+
+		if err != nil {
+			problem = err.Error()
+		} else {
+			ok, problem = pass(res)
+		}
+		if ok {
+			failures = 0
+			continue
+		}
+		failures++
+		if failures >= maxFailures {
+			return fmt.Errorf("%d probes in a row failed during the %v watch (last result: %s)", failures, duration, problem)
+		}
+
+	}
+}
+
+func newProbeClient(cfg healthConfig) *http.Client {
+	return &http.Client{
+		Timeout:       cfg.RequestTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
 func probe(ctx context.Context, client *http.Client, url string) (probeResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

@@ -16,6 +16,7 @@ const (
 	StatusHealthChecking Status = "health_checking"
 	StatusHealthy        Status = "healthy"   // passed checks, not yet receiving traffic
 	StatusSwitching      Status = "switching" // proxy being pointed at the new version
+	StatusObserving      Status = "observing"
 	StatusFailed         Status = "failed"
 	StatusLive           Status = "live"
 	StatusRolledBack     Status = "rolled_back"

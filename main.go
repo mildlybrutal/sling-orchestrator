@@ -23,8 +23,10 @@ type Deployment struct {
 	HostPort    string
 
 	// PreviousUpstream is what the proxy served before this deploy
-	// ("app-<sha>:3000"), or "" if nothing was live. Phase 5 retires it.
+	// ("app-<sha>:3000"), or "" if nothing was live. After the grace window
+	// it is stopped (not removed), so a manual rollback is start + switch.
 	PreviousUpstream string
+	PreviousStopped  bool
 
 	// Status tracking (see status.go). Guarded by mu because the dashboard
 	// API will read these while the pipeline goroutine writes them.
@@ -40,6 +42,11 @@ const (
 	dockerTimeout  = 30 * time.Second
 	cleanupTimeout = 30 * time.Second
 
+	// After cutover, keep the previous version running this long and roll
+	// back if graceMaxFailures proxy probes in a row fail.
+	graceWindow      = 30 * time.Second
+	graceMaxFailures = 3
+
 	// Dev only: lets RepoURL be a local path like ../sling. Turn off before
 	// the webhook server accepts input from the network.
 	allowLocalRepos = true
@@ -49,6 +56,10 @@ var (
 	shaPattern         = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	containerIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	allowedRepoHosts   = map[string]bool{"github.com": true}
+
+	// An upstream Sling itself created: "app-<40 hex>:3000". Anything read
+	// back from Caddy is checked against this before it reaches docker.
+	upstreamPattern = regexp.MustCompile(`^(app-[0-9a-f]{40}):` + appPort + `$`)
 
 	// One deploy at a time. There is a single app for now; the webhook
 	// phase turns this into a per-app lock.
@@ -74,8 +85,8 @@ func main() {
 	fmt.Printf("   Container ID : %s\n", deploy.ContainerID[:12])
 	fmt.Printf("   Public URL   : %s\n", proxyPublicURL)
 	fmt.Printf("   Direct URL   : http://127.0.0.1:%s (bypasses the proxy)\n", deploy.HostPort)
-	if deploy.PreviousUpstream != "" {
-		fmt.Printf("   Previous     : %s (still running; phase 5 retires it)\n", deploy.PreviousUpstream)
+	if deploy.PreviousStopped {
+		fmt.Printf("   Previous     : %s (stopped; start it and switch to roll back)\n", deploy.PreviousUpstream)
 	}
 	deploy.printTimeline()
 }
@@ -136,10 +147,29 @@ func pipeline(d *Deployment) error {
 		return fmt.Errorf("proxy setup failed: %w", err)
 	}
 
+	containerName := fmt.Sprintf("app-%s", d.CommitSHA)
+	upstream := fmt.Sprintf("%s:%s", containerName, appPort)
+
+	// Read what is live now, before touching any container. deployMu is held
+	// for the whole pipeline, so this cannot change underneath us. Redeploying
+	// the live commit is refused: the "docker rm -f" below would kill the
+	// container that is serving traffic.
+	prev, err := currentUpstream(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read current upstream: %w", err)
+	}
+	if prev == upstream {
+		return fmt.Errorf("commit %s is already live", d.CommitSHA)
+	}
+	d.PreviousUpstream = prev
+
 	buildDir := filepath.Join(os.TempDir(), "paas-builds", d.CommitSHA)
 	d.ImageTag = fmt.Sprintf("paas-app:%s", d.CommitSHA)
 
 	_ = os.RemoveAll(buildDir)
+	// The image holds everything the app needs; the checkout is only an
+	// input to docker build. Remove it however the deploy ends.
+	defer removeBuildDir(buildDir)
 
 	d.setStatus(StatusCloning)
 	fmt.Printf("Cloning %s into %s...\n", d.RepoURL, buildDir)
@@ -167,7 +197,6 @@ func pipeline(d *Deployment) error {
 
 	d.setStatus(StatusStarting)
 	fmt.Printf("Starting container on dynamic host port...\n")
-	containerName := fmt.Sprintf("app-%s", d.CommitSHA)
 	_, _ = runCaptureCmd(cleanupTimeout, "", "docker", "rm", "-f", containerName)
 
 	// If anything below fails, don't leave a running container behind.
@@ -228,14 +257,6 @@ func pipeline(d *Deployment) error {
 
 	// Cutover. The proxy keeps serving the previous version until Caddy
 	// has applied the new config, then starts sending requests to the new one.
-	upstream := fmt.Sprintf("%s:%s", containerName, appPort)
-
-	prev, err := currentUpstream(ctx)
-	if err != nil {
-		return fmt.Errorf("could not read current upstream: %w", err)
-	}
-	d.PreviousUpstream = prev
-
 	d.setStatus(StatusSwitching)
 	fmt.Printf("Switching traffic: %q -> %q\n", prev, upstream)
 	if err := setUpstream(ctx, upstream); err != nil {
@@ -248,18 +269,72 @@ func pipeline(d *Deployment) error {
 	// container on sling-net, or still routing to the old one.
 	fmt.Printf("Verifying through the proxy (%s)...\n", proxyPublicURL)
 	if err := waitUntil(ctx, postCutoverHealth, proxyPublicURL+"/health", servedBy(upstream), isRunning); err != nil {
-		rbErr := setUpstream(ctx, prev)
-		if rbErr != nil {
-			return fmt.Errorf("post-cutover check failed (%v) AND rollback failed (%v): the proxy may be pointing at a container that is about to be removed",
-				err, rbErr)
-		}
-		d.setStatus(StatusRolledBack)
-		return fmt.Errorf("post-cutover check failed, traffic restored to %q: %w", prev, err)
+		return rollback(ctx, d, prev, fmt.Errorf("post-cutover check failed: %w", err))
+	}
+
+	// Grace window: the old container is still running, so if the new one
+	// falls over now, rolling back is a single proxy switch.
+	d.setStatus(StatusObserving)
+	fmt.Printf("Observing for %v before retiring the previous version...\n", graceWindow)
+	if err := watch(ctx, postCutoverHealth, proxyPublicURL+"/health", servedBy(upstream),
+		isRunning, graceWindow, graceMaxFailures); err != nil {
+		return rollback(ctx, d, prev, fmt.Errorf("failed during grace window: %w", err))
 	}
 
 	d.setStatus(StatusLive)
 	succeeded = true
+
+	// Housekeeping only: the new version is already live, so a failure here
+	// is a warning, never a failed deploy.
+	d.PreviousStopped = retirePrevious(prev, upstream)
+	prune(upstream, prev)
 	return nil
+}
+
+// rollback points the proxy back at prev ("" = the 503 page) after cause.
+// Both rollback paths (post-cutover check, grace window) go through here so
+// they can't drift apart.
+func rollback(ctx context.Context, d *Deployment, prev string, cause error) error {
+	target := prev
+	if target == "" {
+		target = "no app (503 page)"
+	}
+	if err := setUpstream(ctx, prev); err != nil {
+		return fmt.Errorf("%w AND rollback to %s failed (%w): the proxy may be pointing at a container that is about to be removed",
+			cause, target, err)
+	}
+	d.setStatus(StatusRolledBack)
+	return fmt.Errorf("%w; traffic restored to %s", cause, target)
+}
+
+// previousContainer returns the container behind prev, and false when there
+// is nothing to retire: first deploy, same version redeployed, or a value
+// Sling didn't create.
+func previousContainer(prev, current string) (string, bool) {
+	if prev == "" || prev == current {
+		return "", false
+	}
+	name := upstreamContainer(prev)
+	return name, name != ""
+}
+
+// retirePrevious stops (does not remove) the previous version. docker stop
+// sends SIGTERM and waits up to 10s, so in-flight requests finish; docker
+// rm -f would SIGKILL them. It reports whether a container was stopped.
+func retirePrevious(prev, current string) bool {
+	name, ok := previousContainer(prev, current)
+	if !ok {
+		if prev != "" && prev != current {
+			fmt.Printf("⚠️  not retiring %q: not an upstream Sling created\n", prev)
+		}
+		return false
+	}
+	fmt.Printf("Retiring previous version %s (SIGTERM, up to 10s to drain)...\n", name)
+	if _, err := runCaptureCmd(dockerTimeout, "", "docker", "stop", "-t", "10", name); err != nil {
+		fmt.Printf("⚠️  could not stop %s: %v (the new version is live; stop it by hand)\n", name, err)
+		return false
+	}
+	return true
 }
 
 func containerRunning(id string) (bool, error) {
