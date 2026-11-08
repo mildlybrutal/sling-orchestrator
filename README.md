@@ -40,7 +40,7 @@ VPS that you own.
 | **A broken build never gets traffic** | It needs 3 healthy `/health` responses in a row from the container directly. If the container crashes, the check fails at once. |
 | **It checks the new version is the one answering** | After the switch it probes through the proxy and requires the `X-Sling-Upstream` header to name the *new* container, not just "something answered 200". |
 | **Automatic rollback** | If the post-switch check or the 30s grace window fails (3 probes in a row), the proxy is pointed back at the previous version. |
-| **Old connections finish cleanly** | The previous version is stopped with `docker stop` (SIGTERM, 10s to finish), not killed, and is kept so a manual rollback is just start + switch. |
+| **Old connections finish cleanly** | The previous version is stopped with `docker stop` (SIGTERM, 10s to finish), not killed, and its image is kept, so `sling rollback` can bring it back in seconds, with no rebuild and through every check. |
 | **Resource limits** | Each app gets 256 MB of memory and 0.5 CPU, and its port is reachable only from the server itself (loopback). |
 | **One deploy at a time** | A lock stops two deploys from fighting over the proxy. |
 | **Live commit is not redeployed** | Redeploying the commit that is already live is skipped before any container is touched. |
@@ -226,9 +226,9 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    cmd["cmd/sling<br/>CLI: deploy one commit, or serve"]
-    webhook["internal/webhook<br/>signed pushes → queue → worker"]
-    deploy["internal/deploy<br/>pipeline, rollback, retire, prune, status"]
+    cmd["cmd/sling<br/>CLI: deploy, rollback, status, serve"]
+    webhook["internal/webhook<br/>signed pushes → queue → worker; GET /deploys"]
+    deploy["internal/deploy<br/>build + release, Rollback, CurrentState, lock, prune"]
     proxy["internal/proxy<br/>Caddy: Ensure, SetUpstream, CurrentUpstream"]
     health["internal/health<br/>WaitUntil, Watch, Is200, ServedBy"]
     run["internal/run<br/>Streamed / Capture: exec with timeouts, no shell"]
@@ -266,12 +266,12 @@ ask whether the container is still running.
 .
 ├── cmd/sling/            # main(): parses args, runs a deploy or the webhook server
 ├── internal/
-│   ├── deploy/           # the pipeline (pipeline.go), Deployment + statuses,
-│   │                     # rollback/retire, prune, docker helpers, input validation
+│   ├── deploy/           # build + release (pipeline.go), Rollback + CurrentState (state.go),
+│   │                     # file lock, Deployment + statuses, retire, prune, validation
 │   ├── health/           # probing: become healthy (WaitUntil), stay healthy (Watch)
 │   ├── proxy/            # the Caddy container and its admin API
 │   ├── run/              # running git/docker with timeouts, without a shell
-│   └── webhook/          # sling serve: HMAC check, push filtering, deploy queue
+│   └── webhook/          # sling serve: HMAC check, push filtering, deploy queue, GET /deploys
 ├── scripts/              # run-cases.sh (end-to-end), send-webhook.sh (fake GitHub push)
 ├── .env.example          # webhook settings; copy to .env (git-ignored)
 ├── Makefile              # build, test, test-integration, e2e, vet
@@ -302,6 +302,32 @@ A successful run ends with the live container, URLs, the previous version's
 state and a timeline of each stage. Deploying the commit that is already live
 prints "Nothing to do" and exits 0.
 
+### See what's deployed, and undo a deploy
+
+```bash
+./bin/sling status            # what's live, what a rollback would go back to, every kept version
+./bin/sling rollback          # back to the previous version
+./bin/sling rollback 67dd979  # or to any commit whose image is still on this host (full or short SHA)
+```
+
+```
+Live     : app-53a2b2f…:3000 at http://127.0.0.1:8080
+Rollback : sling rollback  →  67dd979
+
+            COMMIT   CONTAINER                IMAGE
+● live      53a2b2f  Up 33 seconds            built 2 hours ago
+↩ previous  67dd979  Exited (0) 1 minute ago  built 3 hours ago
+            399076a  -                        built 3 hours ago
+```
+
+A rollback **doesn't rebuild**: it releases the image that's already on disk,
+through the same checks as a deploy (direct health check, cutover, check
+through the proxy, grace window, automatic rollback if the old version is
+sick too). Running it twice switches back and forth. Only one deploy or
+rollback runs at a time on a host, even across processes: a second one waits
+for the file lock (`$XDG_RUNTIME_DIR/sling.lock`). `status` only reads, so it
+never waits.
+
 ### Deploy on `git push` (webhook server)
 
 ```bash
@@ -309,7 +335,15 @@ export SLING_WEBHOOK_SECRET=$(openssl rand -hex 32)   # required, at least 16 ch
 export SLING_REPO=you/app                              # required, owner/name
 export SLING_BRANCH=main                               # default: main
 export SLING_LISTEN=127.0.0.1:9000                     # default: 127.0.0.1:9000
+export SLING_STATUS_TOKEN=$(openssl rand -hex 32)     # optional: enables GET /deploys
 ./bin/sling serve
+```
+
+With `SLING_STATUS_TOKEN` set, `GET /deploys` returns what's live and the last
+20 deploys (status, timeline, error) as JSON. History is in memory for now:
+
+```bash
+curl -H "Authorization: Bearer $SLING_STATUS_TOKEN" http://127.0.0.1:9000/deploys
 ```
 
 In the GitHub repo, go to **Settings → Webhooks → Add webhook** and set:
@@ -351,7 +385,9 @@ make e2e                                    # end to end: deploys every demo cas
 - [x] Grace window with automatic rollback, and stopping the old version cleanly
 - [x] Webhook server (deploy on `git push`): signed deliveries, a queue where the latest push wins, clean shutdown
 - [ ] Multiple apps with a lock per app and routing per domain
-- [ ] Dashboard and status API (the `Snapshot()` API is already in place)
+- [x] `sling status`, `sling rollback [sha]`, and a `GET /deploys` status API
+- [x] One deploy at a time per host, across processes (file lock)
+- [ ] Persistent deploy history (survives a restart)
+- [ ] Dashboard
 - [ ] TLS through Caddy's automatic HTTPS
 - [x] Cleanup of old containers, images and build folders
-- [ ] A `sling rollback` command

@@ -59,12 +59,14 @@ func locked(d *Deployment, fn func(ctx context.Context) error) error {
 	defer deployMu.Unlock()
 	unlock, err := acquireLock(lockPath())
 	if err != nil {
+		d.setError(err)
 		d.SetStatus(StatusFailed)
 		return err
 	}
 	defer unlock()
 
 	if err := fn(context.Background()); err != nil {
+		d.setError(err)
 		switch s, _ := d.Snapshot(); {
 		case errors.Is(err, ErrAlreadyLive):
 			d.SetStatus(StatusSkipped)

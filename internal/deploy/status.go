@@ -25,8 +25,37 @@ const (
 )
 
 type StatusChange struct {
-	Status Status
-	At     time.Time
+	Status Status    `json:"status"`
+	At     time.Time `json:"at"`
+}
+
+// Info is a JSON-ready copy of a deployment, safe to build while the
+// pipeline is still running (it only reads fields guarded by mu, plus ones
+// fixed before the deployment was handed to the pipeline).
+type Info struct {
+	Kind     string         `json:"kind"`
+	Commit   string         `json:"commit"`
+	Status   Status         `json:"status"`
+	Error    string         `json:"error,omitempty"`
+	Timeline []StatusChange `json:"timeline"`
+}
+
+func (d *Deployment) Info() Info {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	kind := d.Kind
+	if kind == "" {
+		kind = KindDeploy
+	}
+	h := make([]StatusChange, len(d.history))
+	copy(h, d.history)
+	return Info{Kind: kind, Commit: d.CommitSHA, Status: d.status, Error: d.err, Timeline: h}
+}
+
+func (d *Deployment) setError(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.err = err.Error()
 }
 
 func (d *Deployment) SetStatus(s Status) {

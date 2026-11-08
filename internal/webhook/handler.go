@@ -33,6 +33,9 @@ type webhookConfig struct {
 	Repo   string // the one repository allowed to deploy, "owner/name"
 	Branch string // the one branch that deploys
 	Listen string // where the webhook server listens
+
+	// StatusToken guards GET /deploys. Optional: unset disables the endpoint.
+	StatusToken []byte
 }
 
 // loadWebhookConfig reads the server's settings from the environment. The
@@ -43,9 +46,14 @@ func loadWebhookConfig() (webhookConfig, error) {
 		Repo:   os.Getenv("SLING_REPO"),
 		Branch: envOr("SLING_BRANCH", "main"),
 		Listen: envOr("SLING_LISTEN", "127.0.0.1:9000"),
+
+		StatusToken: []byte(os.Getenv("SLING_STATUS_TOKEN")),
 	}
 	if len(cfg.Secret) < 16 {
 		return cfg, errors.New("SLING_WEBHOOK_SECRET must be set to at least 16 characters (try: openssl rand -hex 32)")
+	}
+	if n := len(cfg.StatusToken); n > 0 && n < 16 {
+		return cfg, errors.New("SLING_STATUS_TOKEN must be at least 16 characters, or unset (try: openssl rand -hex 32)")
 	}
 	if !repoNamePattern.MatchString(cfg.Repo) {
 		return cfg, fmt.Errorf("SLING_REPO must be \"owner/name\", got %q", cfg.Repo)

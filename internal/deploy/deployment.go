@@ -15,6 +15,8 @@ import (
 
 // Deployment is one attempt to put one commit live.
 type Deployment struct {
+	// Kind is KindDeploy or KindRollback ("" means deploy).
+	Kind      string
 	RepoURL   string
 	CommitSHA string
 
@@ -37,7 +39,13 @@ type Deployment struct {
 	mu      sync.Mutex
 	status  Status
 	history []StatusChange
+	err     string // why it ended badly, if it did
 }
+
+const (
+	KindDeploy   = "deploy"
+	KindRollback = "rollback"
+)
 
 const (
 	cloneTimeout   = 1 * time.Minute

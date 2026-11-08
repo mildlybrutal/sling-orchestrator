@@ -30,8 +30,16 @@ func Serve() error {
 		close(workerDone)
 	}()
 
+	recent := &recentDeploys{max: recentDeploysKept}
+	submit := func(d *deploy.Deployment) {
+		if q.submit(d) {
+			recent.add(d)
+		}
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("/webhook", &webhookHandler{cfg: cfg, submit: q.submit})
+	mux.Handle("/webhook", &webhookHandler{cfg: cfg, submit: submit})
+	mux.Handle("/deploys", &deploysHandler{token: cfg.StatusToken, recent: recent, live: proxy.CurrentUpstream})
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           mux,
@@ -47,6 +55,11 @@ func Serve() error {
 	errc := make(chan error, 1)
 	go func() {
 		log.Printf("Sling listening on http://%s/webhook (repo %s, branch %s)", cfg.Listen, cfg.Repo, cfg.Branch)
+		if len(cfg.StatusToken) > 0 {
+			log.Printf("deploy history at http://%s/deploys (Authorization: Bearer $SLING_STATUS_TOKEN)", cfg.Listen)
+		} else {
+			log.Printf("GET /deploys is off; set SLING_STATUS_TOKEN to enable it")
+		}
 		errc <- srv.ListenAndServe()
 	}()
 

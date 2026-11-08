@@ -22,13 +22,15 @@ func newDeployQueue(run func(*deploy.Deployment)) *deployQueue {
 	return &deployQueue{wake: make(chan struct{}, 1), run: run}
 }
 
-func (q *deployQueue) submit(d *deploy.Deployment) {
+// submit queues d and reports whether it was accepted (false: that commit
+// was already waiting).
+func (q *deployQueue) submit(d *deploy.Deployment) bool {
 	q.mu.Lock()
 	old := q.pending
 	if old != nil && old.CommitSHA == d.CommitSHA {
 		q.mu.Unlock()
 		log.Printf("%s is already queued", d.CommitSHA[:7])
-		return
+		return false
 	}
 	q.pending = d
 	q.mu.Unlock()
@@ -41,6 +43,7 @@ func (q *deployQueue) submit(d *deploy.Deployment) {
 	case q.wake <- struct{}{}:
 	default: // a wake-up is already waiting
 	}
+	return true
 }
 
 func (q *deployQueue) take() *deploy.Deployment {
