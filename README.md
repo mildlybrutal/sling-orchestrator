@@ -198,10 +198,12 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> queued
-    queued --> preparing: deployMu acquired
+    queued --> preparing: deploy lock acquired
     queued --> superseded: newer push replaced it
+    queued --> interrupted: server shut down first
     preparing --> skipped: commit already live
     preparing --> cloning
+    preparing --> starting: rollback (no build)
     cloning --> building
     building --> starting
     starting --> health_checking
@@ -222,6 +224,10 @@ stateDiagram-v2
     rolled_back --> [*]
 ```
 
+Not drawn: any in-progress state can end as **`interrupted`** if the Sling
+process dies. The next deploy, holding the lock, finds it in the history and
+marks it.
+
 ### Package map
 
 ```mermaid
@@ -229,13 +235,17 @@ flowchart TD
     cmd["cmd/sling<br/>CLI: deploy, rollback, status, serve"]
     webhook["internal/webhook<br/>signed pushes → queue → worker; GET /deploys"]
     deploy["internal/deploy<br/>build + release, Rollback, CurrentState, lock, prune"]
+    history["internal/history<br/>SQLite deploy history (pure Go)"]
     proxy["internal/proxy<br/>Caddy: Ensure, SetUpstream, CurrentUpstream"]
     health["internal/health<br/>WaitUntil, Watch, Is200, ServedBy"]
     run["internal/run<br/>Streamed / Capture: exec with timeouts, no shell"]
 
     cmd --> webhook
     cmd --> deploy
+    cmd --> history
     webhook --> deploy
+    webhook --> history
+    history --> deploy
     deploy --> proxy
     deploy --> health
     deploy --> run
@@ -268,6 +278,7 @@ ask whether the container is still running.
 ├── internal/
 │   ├── deploy/           # build + release (pipeline.go), Rollback + CurrentState (state.go),
 │   │                     # file lock, Deployment + statuses, retire, prune, validation
+│   ├── history/          # SQLite deploy history: Save, Recent, MarkInterrupted
 │   ├── health/           # probing: become healthy (WaitUntil), stay healthy (Watch)
 │   ├── proxy/            # the Caddy container and its admin API
 │   ├── run/              # running git/docker with timeouts, without a shell
@@ -328,6 +339,28 @@ rollback runs at a time on a host, even across processes: a second one waits
 for the file lock (`$XDG_RUNTIME_DIR/sling.lock`). `status` only reads, so it
 never waits.
 
+### Deploy history
+
+```bash
+./bin/sling history       # last 20 deploys and rollbacks; `history 100` for more
+```
+
+```
+STARTED          KIND      COMMIT   STATUS       TOOK  ERROR
+Nov 08 16:46:22  deploy    53a2b2f  live         34s
+Nov 08 16:46:20  deploy    399076a  interrupted  2s    the Sling process stopped while this deploy was health_checking
+Nov 08 16:45:47  rollback  67dd979  live         33s
+Nov 08 16:45:45  deploy    feb2e72  failed       2s    failed to inspect port (container may have exited): ...
+```
+
+Every status change of every deploy, whether from the CLI or `sling serve`, is saved to
+a SQLite file (`$SLING_DATA_DIR/history.db`, default `~/.local/state/sling/history.db`,
+mode `0600`), so history survives restarts. If Sling is killed mid-deploy, the next
+deploy, which holds the lock and so knows nothing else is running, marks it
+**`interrupted`** and records the stage it reached. Check `sling status` after one: a
+deploy killed after the cutover may have left traffic on the new version. History
+is best-effort for the CLI (it warns and deploys anyway) and required for `sling serve`.
+
 ### Deploy on `git push` (webhook server)
 
 ```bash
@@ -340,7 +373,8 @@ export SLING_STATUS_TOKEN=$(openssl rand -hex 32)     # optional: enables GET /d
 ```
 
 With `SLING_STATUS_TOKEN` set, `GET /deploys` returns what's live and the last
-20 deploys (status, timeline, error) as JSON. History is in memory for now:
+20 deploys (status, timeline, error) as JSON, read from the same history file,
+so it includes CLI deploys and survives restarts:
 
 ```bash
 curl -H "Authorization: Bearer $SLING_STATUS_TOKEN" http://127.0.0.1:9000/deploys
@@ -387,7 +421,7 @@ make e2e                                    # end to end: deploys every demo cas
 - [ ] Multiple apps with a lock per app and routing per domain
 - [x] `sling status`, `sling rollback [sha]`, and a `GET /deploys` status API
 - [x] One deploy at a time per host, across processes (file lock)
-- [ ] Persistent deploy history (survives a restart)
+- [x] Persistent deploy history (SQLite), `sling history`, crash detection (`interrupted`)
 - [ ] Dashboard
 - [ ] TLS through Caddy's automatic HTTPS
 - [x] Cleanup of old containers, images and build folders

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
+	"github.com/mildlybrutal/sling-orchestrator/internal/history"
 	"github.com/mildlybrutal/sling-orchestrator/internal/proxy"
 )
 
@@ -22,6 +23,21 @@ func Serve() error {
 		return err
 	}
 
+	// History is required here: it's what GET /deploys serves and how a
+	// deploy cut off by a crash is found later.
+	path, err := history.DefaultPath()
+	if err != nil {
+		return err
+	}
+	store, err := history.Open(path)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	deploy.SetRecorder(store)
+	defer deploy.SetRecorder(nil)
+	log.Printf("deploy history: %s", path)
+
 	q := newDeployQueue(deployAndLog)
 	stop := make(chan struct{})
 	workerDone := make(chan struct{})
@@ -30,16 +46,11 @@ func Serve() error {
 		close(workerDone)
 	}()
 
-	recent := &recentDeploys{max: recentDeploysKept}
-	submit := func(d *deploy.Deployment) {
-		if q.submit(d) {
-			recent.add(d)
-		}
-	}
+	submit := func(d *deploy.Deployment) { q.submit(d) }
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", &webhookHandler{cfg: cfg, submit: submit})
-	mux.Handle("/deploys", &deploysHandler{token: cfg.StatusToken, recent: recent, live: proxy.CurrentUpstream})
+	mux.Handle("/deploys", &deploysHandler{token: cfg.StatusToken, recent: store.Recent, live: proxy.CurrentUpstream})
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           mux,

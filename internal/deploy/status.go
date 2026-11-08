@@ -1,7 +1,10 @@
 package deploy
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -20,9 +23,18 @@ const (
 	StatusFailed         Status = "failed"
 	StatusLive           Status = "live"
 	StatusRolledBack     Status = "rolled_back"
-	StatusSuperseded     Status = "superseded" // a newer push replaced it before it started
-	StatusSkipped        Status = "skipped"    // that commit was already live
+	StatusSuperseded     Status = "superseded"  // a newer push replaced it before it started
+	StatusSkipped        Status = "skipped"     // that commit was already live
+	StatusInterrupted    Status = "interrupted" // its process stopped before it finished
 )
+
+// InProgress lists the statuses a deploy can only be in while it holds the
+// deploy lock. Finding one of these while WE hold the lock means the process
+// that wrote it died mid-deploy.
+var InProgress = []Status{
+	StatusPreparing, StatusCloning, StatusBuilding, StatusStarting,
+	StatusHealthChecking, StatusHealthy, StatusSwitching, StatusObserving,
+}
 
 type StatusChange struct {
 	Status Status    `json:"status"`
@@ -33,23 +45,71 @@ type StatusChange struct {
 // pipeline is still running (it only reads fields guarded by mu, plus ones
 // fixed before the deployment was handed to the pipeline).
 type Info struct {
+	ID       string         `json:"id"`
 	Kind     string         `json:"kind"`
 	Commit   string         `json:"commit"`
+	Repo     string         `json:"repo,omitempty"`
 	Status   Status         `json:"status"`
 	Error    string         `json:"error,omitempty"`
 	Timeline []StatusChange `json:"timeline"`
 }
 
+// Recorder keeps deploy history somewhere durable. Sling works without one;
+// a recorder that fails only causes a warning, never a failed deploy.
+type Recorder interface {
+	Save(Info) error
+	// MarkInterrupted sets every in-progress deploy except the given ID to
+	// interrupted. Called while holding the deploy lock.
+	MarkInterrupted(exceptID string) (int, error)
+}
+
+var (
+	recMu    sync.Mutex
+	recorder Recorder
+)
+
+// SetRecorder makes every status change of every deployment get saved to r
+// (nil turns recording off).
+func SetRecorder(r Recorder) {
+	recMu.Lock()
+	defer recMu.Unlock()
+	recorder = r
+}
+
+func currentRecorder() Recorder {
+	recMu.Lock()
+	defer recMu.Unlock()
+	return recorder
+}
+
 func (d *Deployment) Info() Info {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.infoLocked()
+}
+
+func (d *Deployment) infoLocked() Info {
 	kind := d.Kind
 	if kind == "" {
 		kind = KindDeploy
 	}
 	h := make([]StatusChange, len(d.history))
 	copy(h, d.history)
-	return Info{Kind: kind, Commit: d.CommitSHA, Status: d.status, Error: d.err, Timeline: h}
+	return Info{ID: d.id, Kind: kind, Commit: d.CommitSHA, Repo: d.RepoURL, Status: d.status, Error: d.err, Timeline: h}
+}
+
+// ID identifies this deployment in the history. It is assigned on the first
+// status change and sorts by time.
+func (d *Deployment) ID() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.id
+}
+
+func newID(t time.Time) string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return t.UTC().Format("20060102T150405.000000Z") + "-" + hex.EncodeToString(b)
 }
 
 func (d *Deployment) setError(err error) {
@@ -59,10 +119,22 @@ func (d *Deployment) setError(err error) {
 }
 
 func (d *Deployment) SetStatus(s Status) {
+	now := time.Now()
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d.id == "" {
+		d.id = newID(now)
+	}
 	d.status = s
-	d.history = append(d.history, StatusChange{Status: s, At: time.Now()})
+	d.history = append(d.history, StatusChange{Status: s, At: now})
+	info := d.infoLocked()
+	d.mu.Unlock()
+
+	// Outside d.mu: a slow disk must not block readers of this deployment.
+	if r := currentRecorder(); r != nil {
+		if err := r.Save(info); err != nil {
+			fmt.Printf("⚠️  could not save deploy history: %v\n", err)
+		}
+	}
 }
 
 // Snapshot returns a copy that is safe to hand to another goroutine.

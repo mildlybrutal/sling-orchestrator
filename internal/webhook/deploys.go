@@ -5,45 +5,16 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
 )
 
-// How many recent deploys GET /deploys remembers. In memory only: a restart
-// forgets them (persistent history is the next roadmap step).
-const recentDeploysKept = 20
-
-// recentDeploys remembers the last few deploys the server accepted, newest
-// first, including ones still waiting or running.
-type recentDeploys struct {
-	mu   sync.Mutex
-	list []*deploy.Deployment
-	max  int
-}
-
-func (r *recentDeploys) add(d *deploy.Deployment) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.list = append([]*deploy.Deployment{d}, r.list...)
-	if len(r.list) > r.max {
-		r.list = r.list[:r.max]
-	}
-}
-
-func (r *recentDeploys) infos() []deploy.Info {
-	r.mu.Lock()
-	ds := append([]*deploy.Deployment(nil), r.list...)
-	r.mu.Unlock()
-	out := make([]deploy.Info, 0, len(ds))
-	for _, d := range ds {
-		out = append(out, d.Info()) // each Info takes that deployment's own lock
-	}
-	return out
-}
+// How many recent deploys GET /deploys returns.
+const recentDeploysShown = 20
 
 type deploysResponse struct {
 	Live      string        `json:"live"` // upstream Caddy routes to; "" = nothing
@@ -52,12 +23,13 @@ type deploysResponse struct {
 }
 
 // deploysHandler serves GET /deploys: what is live, and the recent deploys
-// with their timelines and errors. Error text can include container logs,
+// (from the history store, so CLI deploys and ones from before a restart
+// show up too) with their timelines and errors. Error text can include container logs,
 // so it needs a bearer token (SLING_STATUS_TOKEN); without one configured
 // the endpoint does not exist.
 type deploysHandler struct {
 	token  []byte
-	recent *recentDeploys
+	recent func(limit int) ([]deploy.Info, error) // newest first
 	live   func(ctx context.Context) (string, error)
 }
 
@@ -79,7 +51,13 @@ func (h *deploysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	resp := deploysResponse{Deploys: h.recent.infos()}
+	deploys, err := h.recent(recentDeploysShown)
+	if err != nil {
+		log.Printf("GET /deploys: %v", err)
+		reply(w, http.StatusInternalServerError, "could not read deploy history")
+		return
+	}
+	resp := deploysResponse{Deploys: deploys}
 	if live, err := h.live(ctx); err != nil {
 		resp.LiveError = err.Error()
 	} else {

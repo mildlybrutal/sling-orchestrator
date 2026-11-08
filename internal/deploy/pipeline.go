@@ -51,7 +51,9 @@ func Run(d *Deployment) error {
 // status instead of plain "failed", and one whose commit was already live
 // is "skipped".
 func locked(d *Deployment, fn func(ctx context.Context) error) error {
-	d.SetStatus(StatusQueued)
+	if s, _ := d.Snapshot(); s == "" {
+		d.SetStatus(StatusQueued) // the webhook queue may already have done this
+	}
 
 	// In-process first (cheap, and keeps goroutines in "sling serve" in
 	// order), then the file lock, which also covers other Sling processes.
@@ -64,6 +66,16 @@ func locked(d *Deployment, fn func(ctx context.Context) error) error {
 		return err
 	}
 	defer unlock()
+
+	// We hold the lock, so no other deploy is running. Any deploy the history
+	// still shows as in progress belongs to a process that died mid-deploy.
+	if r := currentRecorder(); r != nil {
+		if n, err := r.MarkInterrupted(d.ID()); err != nil {
+			fmt.Printf("⚠️  deploy history: %v\n", err)
+		} else if n > 0 {
+			fmt.Printf("Marked %d earlier deploy(s) as interrupted (their process stopped mid-deploy)\n", n)
+		}
+	}
 
 	if err := fn(context.Background()); err != nil {
 		d.setError(err)

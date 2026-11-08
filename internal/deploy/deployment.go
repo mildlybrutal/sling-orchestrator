@@ -30,13 +30,14 @@ type Deployment struct {
 
 	// PreviousUpstream is what the proxy served before this deploy
 	// ("app-<sha>:3000"), or "" if nothing was live. After the grace window
-	// it is stopped (not removed), so a manual rollback is start + switch.
+	// it is stopped (not removed), so "sling rollback" can bring it back.
 	PreviousUpstream string
 	PreviousStopped  bool
 
 	// Status tracking (see status.go). Guarded by mu because the dashboard
 	// API will read these while the pipeline goroutine writes them.
 	mu      sync.Mutex
+	id      string // see ID()
 	status  Status
 	history []StatusChange
 	err     string // why it ended badly, if it did

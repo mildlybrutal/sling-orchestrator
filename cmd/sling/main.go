@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
+	"github.com/mildlybrutal/sling-orchestrator/internal/history"
 	"github.com/mildlybrutal/sling-orchestrator/internal/proxy"
 	"github.com/mildlybrutal/sling-orchestrator/internal/webhook"
 )
@@ -22,8 +25,9 @@ const usage = `usage:
   %[1]s <repo-url-or-path> <40-char-commit-sha>   build and deploy one commit
   %[1]s rollback [sha]                            go back to the previous version, or to <sha> (full or short) if its image exists
   %[1]s status                                    show what is live and what can be rolled back to
+  %[1]s history [n]                               the last n deploys and rollbacks (default 20), from any Sling process
   %[1]s serve                                     run the webhook server
-(a local repo literally named "rollback", "status" or "serve": write ./name)`
+(a local repo literally named "rollback", "status", "history" or "serve": write ./name)`
 
 func main() {
 	log.SetFlags(0) // CLI errors read better without a timestamp
@@ -38,13 +42,27 @@ func main() {
 		if err := status(); err != nil {
 			log.Fatal(err)
 		}
+	case len(args) >= 1 && len(args) <= 2 && args[0] == "history":
+		n := 20
+		if len(args) == 2 {
+			v, err := strconv.Atoi(args[1])
+			if err != nil || v < 1 || v > 1000 {
+				log.Fatalf("history: n must be a number from 1 to 1000, got %q", args[1])
+			}
+			n = v
+		}
+		if err := showHistory(n); err != nil {
+			log.Fatal(err)
+		}
 	case len(args) >= 1 && len(args) <= 2 && args[0] == "rollback":
+		defer recordHistory()()
 		d := &deploy.Deployment{}
 		if len(args) == 2 {
 			d.CommitSHA = args[1]
 		}
 		finish(d, deploy.Rollback(d))
 	case len(args) == 2:
+		defer recordHistory()()
 		d := &deploy.Deployment{
 			RepoURL:        args[0],
 			CommitSHA:      args[1],
@@ -127,6 +145,63 @@ func status() error {
 			image = "built " + v.ImageAge
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", mark, short(v.SHA), container, image)
+	}
+	return w.Flush()
+}
+
+// recordHistory saves this command's deploy to the shared history file.
+// History is a convenience for the CLI: if it can't be opened, warn and
+// deploy anyway. It returns the function that closes it.
+func recordHistory() func() {
+	path, err := history.DefaultPath()
+	if err == nil {
+		var store *history.Store
+		if store, err = history.Open(path); err == nil {
+			deploy.SetRecorder(store)
+			return func() { deploy.SetRecorder(nil); store.Close() }
+		}
+	}
+	fmt.Printf("⚠️  deploy history is off: %v\n", err)
+	return func() {}
+}
+
+func showHistory(n int) error {
+	path, err := history.DefaultPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		fmt.Println("No deploys recorded yet.")
+		return nil
+	}
+	store, err := history.Open(path)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	list, err := store.Recent(n)
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("No deploys recorded yet.")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "STARTED\tKIND\tCOMMIT\tSTATUS\tTOOK\tERROR")
+	for _, in := range list {
+		start, end := in.Timeline[0].At, in.Timeline[len(in.Timeline)-1].At
+		took := end.Sub(start).Round(time.Second).String()
+		errText := in.Error
+		if i := strings.IndexByte(errText, '\n'); i >= 0 {
+			errText = errText[:i] // first line; container logs follow it
+		}
+		if len(errText) > 70 {
+			errText = errText[:67] + "..."
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			start.Local().Format("Jan 02 15:04:05"), in.Kind, short(in.Commit), in.Status, took, errText)
 	}
 	return w.Flush()
 }

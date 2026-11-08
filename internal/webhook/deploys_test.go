@@ -15,9 +15,31 @@ import (
 
 const testToken = "tok-0123456789abcdef"
 
-func newDeploysHandler(token string, live func(context.Context) (string, error)) (*deploysHandler, *recentDeploys) {
-	r := &recentDeploys{max: 3}
-	return &deploysHandler{token: []byte(token), recent: r, live: live}, r
+// fakeHistory is the store's Recent, backed by a slice (newest first).
+type fakeHistory struct {
+	list []*deploy.Deployment
+	err  error
+}
+
+func (f *fakeHistory) add(d *deploy.Deployment) { f.list = append([]*deploy.Deployment{d}, f.list...) }
+
+func (f *fakeHistory) recent(limit int) ([]deploy.Info, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := []deploy.Info{}
+	for i, d := range f.list {
+		if i == limit {
+			break
+		}
+		out = append(out, d.Info())
+	}
+	return out, nil
+}
+
+func newDeploysHandler(token string, live func(context.Context) (string, error)) (*deploysHandler, *fakeHistory) {
+	f := &fakeHistory{}
+	return &deploysHandler{token: []byte(token), recent: f.recent, live: live}, f
 }
 
 func getDeploys(h http.Handler, auth string) *httptest.ResponseRecorder {
@@ -103,14 +125,21 @@ func TestDeploysLiveError(t *testing.T) {
 	}
 }
 
-func TestRecentDeploysKeepsNewest(t *testing.T) {
-	r := &recentDeploys{max: 3}
-	for i := 0; i < 5; i++ {
-		r.add(&deploy.Deployment{CommitSHA: fmt.Sprint(i)})
+func TestDeploysLimitAndHistoryError(t *testing.T) {
+	h, f := newDeploysHandler(testToken, liveIs(""))
+	for i := 0; i < recentDeploysShown+5; i++ {
+		f.add(&deploy.Deployment{CommitSHA: fmt.Sprint(i)})
 	}
-	infos := r.infos()
-	if len(infos) != 3 || infos[0].Commit != "4" || infos[2].Commit != "2" {
-		t.Fatalf("want 4,3,2; got %+v", infos)
+	var got deploysResponse
+	_ = json.Unmarshal(getDeploys(h, "Bearer "+testToken).Body.Bytes(), &got)
+	if len(got.Deploys) != recentDeploysShown {
+		t.Errorf("want %d deploys, got %d", recentDeploysShown, len(got.Deploys))
+	}
+
+	f.err = errors.New("disk on fire")
+	rec := getDeploys(h, "Bearer "+testToken)
+	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "disk") {
+		t.Errorf("history error: want a 500 that doesn't leak details, got %d %q", rec.Code, rec.Body)
 	}
 }
 

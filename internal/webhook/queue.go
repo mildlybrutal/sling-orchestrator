@@ -34,6 +34,7 @@ func (q *deployQueue) submit(d *deploy.Deployment) bool {
 	}
 	q.pending = d
 	q.mu.Unlock()
+	d.SetStatus(deploy.StatusQueued) // recorded from the moment it arrives
 
 	if old != nil {
 		old.SetStatus(deploy.StatusSuperseded)
@@ -68,6 +69,7 @@ func (q *deployQueue) worker(stop <-chan struct{}) {
 		select {
 		case <-stop:
 			if left := q.take(); left != nil {
+				left.SetStatus(deploy.StatusInterrupted)
 				log.Printf("shutting down: %s was queued and will not deploy", left.CommitSHA[:7])
 			}
 			return
@@ -78,6 +80,7 @@ func (q *deployQueue) worker(stop <-chan struct{}) {
 			select {
 			case <-stop:
 				if left := q.take(); left != nil {
+					left.SetStatus(deploy.StatusInterrupted)
 					log.Printf("shutting down: %s was queued and will not deploy", left.CommitSHA[:7])
 				}
 				return
