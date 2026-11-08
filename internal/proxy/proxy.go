@@ -1,4 +1,7 @@
-package main
+// Package proxy runs the Caddy reverse proxy in front of the apps and switches
+// its upstream through the admin API. One config is built from one value
+// (the upstream), so boot, cutover and rollback all use the same code.
+package proxy
 
 import (
 	"bytes"
@@ -9,13 +12,17 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/run"
 )
 
 const (
-	networkName = "sling-net"
+	// NetworkName is the Docker network Caddy and every app container join.
+	NetworkName = "sling-net"
 	proxyName   = "sling-caddy"
 	proxyImage  = "caddy:2.11.7-alpine"
-	appPort     = "3000"
+	// AppPort is the port every app must listen on inside its container.
+	AppPort = "3000"
 
 	proxyBind     = "127.0.0.1"
 	proxyHostPort = "8080"
@@ -25,22 +32,18 @@ const (
 	httpServerName = "sling"
 
 	proxyStartTimeout = 3 * time.Minute
+	dockerTimeout     = 30 * time.Second
 )
 
 var (
-	caddyAdminURL  = "http://127.0.0.1:" + adminHostPort
-	proxyPublicURL = "http://" + proxyBind + ":" + proxyHostPort
-	adminClient    = &http.Client{Timeout: 10 * time.Second}
-
-	postCutoverHealth = healthConfig{
-		Interval:       500 * time.Millisecond,
-		Deadline:       10 * time.Second,
-		RequestTimeout: 2 * time.Second,
-		RequiredStreak: 3,
-	}
+	caddyAdminURL = "http://127.0.0.1:" + adminHostPort
+	// PublicURL is where users (and post-cutover checks) reach the proxy.
+	PublicURL   = "http://" + proxyBind + ":" + proxyHostPort
+	adminClient = &http.Client{Timeout: 10 * time.Second}
 )
 
-func buildCaddyConfig(upstream string) ([]byte, error) {
+// BuildConfig returns the whole Caddy JSON config for upstream.
+func BuildConfig(upstream string) ([]byte, error) {
 	var handler map[string]any
 
 	if upstream == "" {
@@ -57,7 +60,7 @@ func buildCaddyConfig(upstream string) ([]byte, error) {
 			"headers": map[string]any{
 				"response": map[string]any{
 					"set": map[string][]string{
-						upstreamHeader: {"{http.reverse_proxy.upstream.hostport}"},
+						UpstreamHeader: {"{http.reverse_proxy.upstream.hostport}"},
 					},
 				},
 			},
@@ -107,16 +110,18 @@ func caddyLoad(ctx context.Context, cfg []byte) error {
 	return nil
 }
 
-// points all traffic to upstream
-func setUpstream(ctx context.Context, upstream string) error {
-	cfg, err := buildCaddyConfig(upstream)
+// SetUpstream points all traffic at upstream ("app-<sha>:3000"), or at the
+// "no app deployed yet" 503 page when upstream is "".
+func SetUpstream(ctx context.Context, upstream string) error {
+	cfg, err := BuildConfig(upstream)
 	if err != nil {
 		return err
 	}
 	return caddyLoad(ctx, cfg)
 }
 
-func currentUpstream(ctx context.Context) (string, error) {
+// CurrentUpstream returns what Caddy is routing to now, or "" for the 503 page.
+func CurrentUpstream(ctx context.Context) (string, error) {
 	url := caddyAdminURL + "/config/apps/http/servers/" + httpServerName + "/routes/0/handle/0/upstreams/0/dial"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -145,35 +150,36 @@ func currentUpstream(ctx context.Context) (string, error) {
 }
 
 func ensureNetwork() error {
-	if _, err := runCaptureCmd(dockerTimeout, "", "docker", "network", "inspect", networkName); err == nil {
+	if _, err := run.Capture(dockerTimeout, "", "docker", "network", "inspect", NetworkName); err == nil {
 		return nil
 	}
-	if _, err := runCaptureCmd(dockerTimeout, "", "docker", "network", "create", networkName); err != nil {
-		return fmt.Errorf("creating network %s: %w", networkName, err)
+	if _, err := run.Capture(dockerTimeout, "", "docker", "network", "create", NetworkName); err != nil {
+		return fmt.Errorf("creating network %s: %w", NetworkName, err)
 	}
 	return nil
 }
 
-//It makes sure that network and Caddy container exist and that Caddy admin API answers, runs after every deploy - safety
-
-func ensureProxy(ctx context.Context) error {
+// Ensure makes sure sling-net and the Caddy container exist and that the admin
+// API answers. It runs at the start of every deploy, so a broken proxy fails
+// the deploy before any build time is spent.
+func Ensure(ctx context.Context) error {
 	if err := ensureNetwork(); err != nil {
 		return err
 	}
 
-	state, err := runCaptureCmd(dockerTimeout, "", "docker", "inspect", "-f", "{{.State.Status}}", proxyName)
+	state, err := run.Capture(dockerTimeout, "", "docker", "inspect", "-f", "{{.State.Status}}", proxyName)
 	switch {
 	case err != nil:
 		// Not created yet: start it with a "no app yet" config.
-		boot, err := buildCaddyConfig("")
+		boot, err := BuildConfig("")
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Starting proxy container %s (first run pulls %s)...\n", proxyName, proxyImage)
-		_, err = runCaptureCmd(proxyStartTimeout, "", "docker", "run", "-d",
+		_, err = run.Capture(proxyStartTimeout, "", "docker", "run", "-d",
 			"--name", proxyName,
 			"--restart", "unless-stopped",
-			"--network", networkName,
+			"--network", NetworkName,
 			"-p", fmt.Sprintf("%s:%s:80", proxyBind, proxyHostPort),
 			"-p", fmt.Sprintf("127.0.0.1:%s:%s", adminHostPort, adminHostPort),
 			"-e", "SLING_BOOT="+string(boot),
@@ -184,15 +190,16 @@ func ensureProxy(ctx context.Context) error {
 			return fmt.Errorf("starting proxy: %w", err)
 		}
 	case state != "running":
-		if _, err := runCaptureCmd(dockerTimeout, "", "docker", "start", proxyName); err != nil {
+		if _, err := run.Capture(dockerTimeout, "", "docker", "start", proxyName); err != nil {
 			return fmt.Errorf("restarting proxy: %w", err)
 		}
 	}
 
-	return waitForAdmin(ctx, 20*time.Second)
+	return WaitForAdmin(ctx, 20*time.Second)
 }
 
-func waitForAdmin(ctx context.Context, limit time.Duration) error {
+// WaitForAdmin polls the admin API until it answers or limit passes.
+func WaitForAdmin(ctx context.Context, limit time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 
@@ -218,4 +225,4 @@ func waitForAdmin(ctx context.Context, limit time.Duration) error {
 // Caddy stamps every proxied response with the upstream that answered it,
 // so Sling can tell which version served a request without relying on
 // anything inside the app.
-const upstreamHeader = "X-Sling-Upstream"
+const UpstreamHeader = "X-Sling-Upstream"

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, vet, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "Run 'make fmt'. These files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: make vet
+
+      - name: Unit tests
+        run: make test
+
+      - name: Build
+        run: make build
+
+  integration:
+    name: Integration tests (real Caddy)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CADDY_VERSION: 2.10.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Caddy
+        run: |
+          curl -fsSL -o caddy.tar.gz \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          tar -xzf caddy.tar.gz caddy
+          # The tests listen on port 80, which normally needs root.
+          sudo setcap cap_net_bind_service=+ep ./caddy
+          ./caddy version
+
+      - name: Integration tests
+        run: make test-integration CADDY=$PWD/caddy

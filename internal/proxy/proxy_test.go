@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -34,7 +34,7 @@ func dig(t *testing.T, v any, path ...any) any {
 
 func decodeConfig(t *testing.T, upstream string) any {
 	t.Helper()
-	raw, err := buildCaddyConfig(upstream)
+	raw, err := BuildConfig(upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestSetUpstreamPostsFullConfigToLoad(t *testing.T) {
 		gotPath, gotType, gotBody = r.Method+" "+r.URL.Path, r.Header.Get("Content-Type"), string(b)
 	})
 
-	if err := setUpstream(context.Background(), "app-abc:3000"); err != nil {
+	if err := SetUpstream(context.Background(), "app-abc:3000"); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "POST /load" || gotType != "application/json" {
@@ -116,7 +116,7 @@ func TestRejectedConfigSurfacesCaddysMessage(t *testing.T) {
 		http.Error(w, `{"error":"bad config"}`, http.StatusBadRequest)
 	})
 
-	err := setUpstream(context.Background(), "app-abc:3000")
+	err := SetUpstream(context.Background(), "app-abc:3000")
 	if err == nil || !strings.Contains(err.Error(), "bad config") || !strings.Contains(err.Error(), "400") {
 		t.Fatalf("expected error carrying status and body, got %v", err)
 	}
@@ -126,11 +126,11 @@ func TestAdminUnreachable(t *testing.T) {
 	fakeAdmin(t, func(w http.ResponseWriter, r *http.Request) {})
 	caddyAdminURL = "http://127.0.0.1:1" // nothing listens here
 
-	if err := setUpstream(context.Background(), "x:1"); err == nil {
+	if err := SetUpstream(context.Background(), "x:1"); err == nil {
 		t.Fatal("expected an error when the admin API is down")
 	}
-	if _, err := currentUpstream(context.Background()); err == nil {
-		t.Fatal("currentUpstream must error (not report 'nothing live') when Caddy is unreachable")
+	if _, err := CurrentUpstream(context.Background()); err == nil {
+		t.Fatal("CurrentUpstream must error (not report 'nothing live') when Caddy is unreachable")
 	}
 }
 
@@ -155,7 +155,7 @@ func TestCurrentUpstream(t *testing.T) {
 				w.WriteHeader(c.status)
 				_, _ = io.WriteString(w, c.body)
 			})
-			got, err := currentUpstream(context.Background())
+			got, err := CurrentUpstream(context.Background())
 			if (err != nil) != c.wantErr || got != c.want {
 				t.Fatalf("got (%q, %v), want (%q, err=%v)", got, err, c.want, c.wantErr)
 			}

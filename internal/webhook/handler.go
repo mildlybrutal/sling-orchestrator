@@ -1,4 +1,6 @@
-package main
+// Package webhook runs "sling serve": it checks signed GitHub push deliveries
+// and feeds their commits into a queue where the latest push wins.
+package webhook
 
 import (
 	"crypto/hmac"
@@ -13,6 +15,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
 )
 
 // GitHub caps webhook payloads at 25 MB, but a push event is a few KB. Read
@@ -77,7 +81,7 @@ type pushEvent struct {
 
 type webhookHandler struct {
 	cfg    webhookConfig
-	submit func(*Deployment)
+	submit func(*deploy.Deployment)
 }
 
 // ServeHTTP checks, in this order: method, size, signature, event, repo,
@@ -137,12 +141,12 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, "ignored: branch deleted")
 		return
 	}
-	if !shaPattern.MatchString(ev.After) {
+	if !deploy.ValidSHA(ev.After) {
 		reply(w, http.StatusBadRequest, "invalid commit SHA")
 		return
 	}
 
-	h.submit(&Deployment{RepoURL: h.cfg.cloneURL(), CommitSHA: ev.After})
+	h.submit(&deploy.Deployment{RepoURL: h.cfg.cloneURL(), CommitSHA: ev.After})
 	log.Printf("webhook %q: queued %s", delivery, ev.After[:7])
 	// GitHub gives up after 10 s, and a deploy takes longer. Answer now,
 	// deploy in the background.

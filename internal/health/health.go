@@ -1,4 +1,6 @@
-package main
+// Package health probes HTTP endpoints until they become healthy (WaitUntil)
+// or while they must stay healthy (Watch).
+package health
 
 import (
 	"context"
@@ -8,47 +10,47 @@ import (
 	"time"
 )
 
-type healthConfig struct {
+type Config struct {
 	Interval       time.Duration
 	Deadline       time.Duration
 	RequestTimeout time.Duration
 	RequiredStreak int
 }
 
-var defaultHealthConfig = healthConfig{
+var Default = Config{
 	Interval:       500 * time.Millisecond,
 	Deadline:       30 * time.Second,
 	RequestTimeout: 2 * time.Second,
 	RequiredStreak: 3,
 }
 
-// probeResult is what one GET returned.
-type probeResult struct {
+// Result is what one GET returned.
+type Result struct {
 	Code   int
 	Header http.Header
 }
 
 // check judges one probe. It returns whether the probe passed and a short
 // description of the result, used in error messages either way.
-type check func(r probeResult) (ok bool, problem string)
+type Check func(r Result) (ok bool, problem string)
 
-// is200 passes on HTTP 200.
-func is200(r probeResult) (bool, string) {
+// Is200 passes on HTTP 200.
+func Is200(r Result) (bool, string) {
 	if r.Code != http.StatusOK {
 		return false, fmt.Sprintf("HTTP %d", r.Code)
 	}
 	return true, "HTTP 200"
 }
 
-// servedBy passes on HTTP 200 answered by the given upstream, as reported by
-// the proxy in upstreamHeader. It proves the NEW version answered, not just
+// ServedBy passes on HTTP 200 answered by the given upstream, as reported by
+// the proxy in the given header. It proves the NEW version answered, not just
 // that something healthy did.
-func servedBy(upstream string) check {
-	return func(r probeResult) (bool, string) {
-		if ok, problem := is200(r); !ok {
+func ServedBy(header, upstream string) Check {
+	return func(r Result) (bool, string) {
+		if ok, problem := Is200(r); !ok {
 			return false, problem
 		}
-		got := r.Header.Get(upstreamHeader)
+		got := r.Header.Get(header)
 		if got != upstream {
 			return false, fmt.Sprintf("HTTP 200 but served by %q, want %q", got, upstream)
 		}
@@ -56,15 +58,15 @@ func servedBy(upstream string) check {
 	}
 }
 
-// waitHealthy waits until url returns HTTP 200 RequiredStreak times in a row.
-func waitHealthy(ctx context.Context, cfg healthConfig, url string, isRunning func() (bool, error)) error {
-	return waitUntil(ctx, cfg, url, is200, isRunning)
+// WaitHealthy waits until url returns HTTP 200 RequiredStreak times in a row.
+func WaitHealthy(ctx context.Context, cfg Config, url string, isRunning func() (bool, error)) error {
+	return WaitUntil(ctx, cfg, url, Is200, isRunning)
 }
 
-// waitUntil probes url every Interval until pass accepts RequiredStreak
+// WaitUntil probes url every Interval until pass accepts RequiredStreak
 // probes in a row. Any rejected probe resets the streak. It fails at the
 // Deadline, or at once if the container stops running.
-func waitUntil(ctx context.Context, cfg healthConfig, url string, pass check, isRunning func() (bool, error)) error {
+func WaitUntil(ctx context.Context, cfg Config, url string, pass Check, isRunning func() (bool, error)) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.Deadline)
 	defer cancel()
 
@@ -118,7 +120,10 @@ func waitUntil(ctx context.Context, cfg healthConfig, url string, pass check, is
 	}
 }
 
-func watch(ctx context.Context, cfg healthConfig, url string, pass check, isRunning func() (bool, error), duration time.Duration, maxFailures int) error {
+// Watch probes url every Interval for duration and fails as soon as
+// maxFailures probes in a row are rejected, or the container stops running.
+// Reaching the end of the window is success; a cancelled caller is not.
+func Watch(ctx context.Context, cfg Config, url string, pass Check, isRunning func() (bool, error), duration time.Duration, maxFailures int) error {
 	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
@@ -168,24 +173,24 @@ func watch(ctx context.Context, cfg healthConfig, url string, pass check, isRunn
 	}
 }
 
-func newProbeClient(cfg healthConfig) *http.Client {
+func newProbeClient(cfg Config) *http.Client {
 	return &http.Client{
 		Timeout:       cfg.RequestTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }
 
-func probe(ctx context.Context, client *http.Client, url string) (probeResult, error) {
+func probe(ctx context.Context, client *http.Client, url string) (Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return probeResult{}, err
+		return Result{}, err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return probeResult{}, err
+		return Result{}, err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return probeResult{Code: resp.StatusCode, Header: resp.Header}, nil
+	return Result{Code: resp.StatusCode, Header: resp.Header}, nil
 }

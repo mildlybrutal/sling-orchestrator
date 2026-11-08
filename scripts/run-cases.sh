@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 PUBLIC="http://127.0.0.1:8080"
 
-go build -o sling . || exit 1
+go build -o bin/sling ./cmd/sling || exit 1
 
 cleanup() {
   ids="$(docker ps -aq --filter label=sling.managed=true)"
@@ -45,7 +45,7 @@ for c in "${CASES[@]}"; do
   sha="$(git -C "$DEMO" rev-parse "$tag")" || { echo "unknown tag $tag"; exit 1; }
 
   log="$(mktemp)"
-  if ./sling "$DEMO" "$sha" >"$log" 2>&1; then got=pass; else got=fail; fi
+  if ./bin/sling "$DEMO" "$sha" >"$log" 2>&1; then got=pass; else got=fail; fi
   [ "$got" = pass ] && live="$sha"
 
   # What do real users see right now?

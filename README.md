@@ -1,5 +1,7 @@
 # Sling
 
+[![CI](https://github.com/mildlybrutal/sling-orchestrator/actions/workflows/main.yaml/badge.svg)](https://github.com/mildlybrutal/sling-orchestrator/actions/workflows/main.yaml)
+
 **Push a commit, and it goes live with no downtime or rolls itself back.**
 Sling is a small self-hosted deploy orchestrator written in Go. You give it a git
 repo and an exact commit. It builds a Docker image, starts the new version beside
@@ -7,7 +9,7 @@ the old one, proves it is healthy, switches a Caddy proxy over to it, and keeps
 watching. If anything fails along the way, traffic goes back to the previous version.
 
 ```
-go run . https://github.com/you/app <40-char-commit-sha>
+go run ./cmd/sling https://github.com/you/app <40-char-commit-sha>
 ```
 
 ---
@@ -104,18 +106,18 @@ flowchart LR
 
 **Components**
 
-- **Orchestrator** (`main.go`): runs the deploy pipeline from start to finish and
+- **Orchestrator** (`internal/deploy`): runs the deploy pipeline from start to finish and
   records each status change.
-- **Webhook server** (`serve.go`, `webhook.go`): `sling serve` checks each GitHub
+- **Webhook server** (`internal/webhook`): `sling serve` checks each GitHub
   push delivery and hands the commit to the deploy queue.
-- **Deploy queue** (`queue.go`): one worker, one waiting slot. The latest push wins,
+- **Deploy queue** (`internal/webhook/queue.go`): one worker, one waiting slot. The latest push wins,
   and a deploy that is running always finishes, even during shutdown.
-- **Proxy control** (`proxy.go`): makes sure `sling-net` and the `sling-caddy`
+- **Proxy control** (`internal/proxy`): makes sure `sling-net` and the `sling-caddy`
   container exist. It builds the Caddy JSON config and swaps the upstream
   in one step through the admin API.
-- **Health gate** (`health.go`): `waitUntil` (N passes in a row before a
+- **Health gate** (`internal/health`): `WaitUntil` (N passes in a row before a
   deadline) and `watch` (fail after N failures in a row during a window).
-- **Status tracking** (`status.go`): a status machine guarded by a mutex, with a
+- **Status tracking** (`internal/deploy/status.go`): a status machine guarded by a mutex, with a
   timeline, ready for the planned dashboard API.
 
 ## Low-level design (LLD)
@@ -220,69 +222,64 @@ stateDiagram-v2
     rolled_back --> [*]
 ```
 
-### Code map
+### Package map
 
 ```mermaid
-classDiagram
-    class Deployment {
-        +RepoURL string
-        +CommitSHA string
-        +ImageTag string
-        +ContainerID string
-        +HostPort string
-        +PreviousUpstream string
-        +PreviousStopped bool
-        -mu sync.Mutex
-        -status Status
-        -history []StatusChange
-        +setStatus(Status)
-        +Snapshot() (Status, []StatusChange)
-        +printTimeline()
-    }
-    class main_go {
-        runPipeline(d) error
-        pipeline(d) error
-        rollback(ctx, d, prev, cause) error
-        retirePrevious(prev, cur) bool
-        previousContainer(prev, cur) (string, bool)
-        validateRepoURL(raw) error
-        runStreamedCmd() / runCaptureCmd()
-    }
-    class proxy_go {
-        ensureProxy(ctx) error
-        ensureNetwork() error
-        buildCaddyConfig(upstream) []byte
-        setUpstream(ctx, upstream) error
-        currentUpstream(ctx) (string, error)
-        waitForAdmin(ctx, limit) error
-    }
-    class health_go {
-        healthConfig
-        check func(probeResult)(bool,string)
-        is200 / servedBy(upstream)
-        waitHealthy() / waitUntil()
-        watch(ctx, cfg, url, pass, isRunning, dur, max)
-        probe(ctx, client, url)
-    }
-    main_go --> Deployment : updates
-    main_go --> proxy_go : cutover / rollback
-    main_go --> health_go : gates every step
-    health_go ..> proxy_go : upstreamHeader
+flowchart TD
+    cmd["cmd/sling<br/>CLI: deploy one commit, or serve"]
+    webhook["internal/webhook<br/>signed pushes → queue → worker"]
+    deploy["internal/deploy<br/>pipeline, rollback, retire, prune, status"]
+    proxy["internal/proxy<br/>Caddy: Ensure, SetUpstream, CurrentUpstream"]
+    health["internal/health<br/>WaitUntil, Watch, Is200, ServedBy"]
+    run["internal/run<br/>Streamed / Capture: exec with timeouts, no shell"]
+
+    cmd --> webhook
+    cmd --> deploy
+    webhook --> deploy
+    deploy --> proxy
+    deploy --> health
+    deploy --> run
+    proxy --> run
 ```
+
+Dependencies only point down, so there are no import cycles. `health` knows
+nothing about Docker or Caddy; it is told which header to read, and how to
+ask whether the container is still running.
 
 ### Key parameters
 
 | Setting | Value | Where |
 |---|---|---|
-| Direct health check | every 500ms, 3 passes in a row, 30s deadline, 2s per request | `defaultHealthConfig` (health.go) |
-| Post-cutover check | every 500ms, 3 passes in a row, 10s deadline | `postCutoverHealth` (proxy.go) |
-| Grace window | 30s, roll back after 3 failures in a row | `graceWindow`, `graceMaxFailures` (main.go) |
-| Timeouts | clone 1m, git 30s, build 10m, docker 30s | main.go |
-| Public proxy | `127.0.0.1:8080` | proxy.go |
-| Caddy admin | `127.0.0.1:2019` | proxy.go |
-| App container port | `3000` (published on a random loopback port) | proxy.go |
+| Direct health check | every 500ms, 3 passes in a row, 30s deadline, 2s per request | `health.Default` |
+| Post-cutover check | every 500ms, 3 passes in a row, 10s deadline | `postCutoverHealth` (internal/deploy) |
+| Grace window | 30s, roll back after 3 failures in a row | `graceWindow`, `graceMaxFailures` (internal/deploy) |
+| Timeouts | clone 1m, git 30s, build 10m, docker 30s | internal/deploy |
+| Public proxy | `127.0.0.1:8080` | internal/proxy |
+| Caddy admin | `127.0.0.1:2019` | internal/proxy |
+| App container port | `3000` (published on a random loopback port) | internal/proxy |
 
 ---
+
+## Project layout
+
+```
+.
+├── cmd/sling/            # main(): parses args, runs a deploy or the webhook server
+├── internal/
+│   ├── deploy/           # the pipeline (pipeline.go), Deployment + statuses,
+│   │                     # rollback/retire, prune, docker helpers, input validation
+│   ├── health/           # probing: become healthy (WaitUntil), stay healthy (Watch)
+│   ├── proxy/            # the Caddy container and its admin API
+│   ├── run/              # running git/docker with timeouts, without a shell
+│   └── webhook/          # sling serve: HMAC check, push filtering, deploy queue
+├── scripts/              # run-cases.sh (end-to-end), send-webhook.sh (fake GitHub push)
+├── .env.example          # webhook settings; copy to .env (git-ignored)
+├── Makefile              # build, test, test-integration, e2e, vet
+└── README.md
+```
+
+`internal/` means these packages can't be imported by other modules, so their
+APIs can change freely while Sling is young.
 
 ## Usage
 
@@ -295,9 +292,10 @@ classDiagram
 - optionally, reading `APP_VERSION`, which Sling sets to the commit SHA
 
 ```bash
-go run . https://github.com/you/app 0123456789abcdef0123456789abcdef01234567
+make build    # → bin/sling
+./bin/sling https://github.com/you/app 0123456789abcdef0123456789abcdef01234567
 # or, during development, a local path:
-go run . ../sling $(git -C ../sling rev-parse HEAD)
+./bin/sling ../sling $(git -C ../sling rev-parse HEAD)
 ```
 
 A successful run ends with the live container, URLs, the previous version's
@@ -311,7 +309,7 @@ export SLING_WEBHOOK_SECRET=$(openssl rand -hex 32)   # required, at least 16 ch
 export SLING_REPO=you/app                              # required, owner/name
 export SLING_BRANCH=main                               # default: main
 export SLING_LISTEN=127.0.0.1:9000                     # default: 127.0.0.1:9000
-go run . serve
+./bin/sling serve
 ```
 
 In the GitHub repo, go to **Settings → Webhooks → Add webhook** and set:
@@ -340,9 +338,9 @@ good versions, to exercise every path above.
 ## Testing
 
 ```bash
-go test -race ./...                                        # unit tests (webhook, queue, health, prune)
-CADDY=/path/to/caddy go test -tags integration ./...       # against a real Caddy binary
-./scripts/run-cases.sh ../sling                            # end to end: deploys every demo case with Docker
+make test                                   # unit tests with -race (no Docker needed)
+make test-integration CADDY=/path/to/caddy  # against a real Caddy binary
+make e2e                                    # end to end: deploys every demo case with Docker
 ```
 
 ## Roadmap

@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package deploy
 
 import (
 	"context"
@@ -12,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/health"
+	"github.com/mildlybrutal/sling-orchestrator/internal/proxy"
 )
 
 // Kill the new version during the grace window: watch must fail and
@@ -21,7 +24,7 @@ func TestRealCaddyGraceRollback(t *testing.T) {
 	if bin == "" {
 		t.Skip("set CADDY to a caddy binary")
 	}
-	boot, _ := buildCaddyConfig("")
+	boot, _ := proxy.BuildConfig("")
 	f, _ := os.CreateTemp("", "boot*.json")
 	f.Write(boot)
 	f.Close()
@@ -29,8 +32,8 @@ func TestRealCaddyGraceRollback(t *testing.T) {
 	cmd.Start()
 	defer cmd.Process.Kill()
 	ctx := context.Background()
-	proxyPublicURL = "http://127.0.0.1:80"
-	if err := waitForAdmin(ctx, 10*time.Second); err != nil {
+	proxy.PublicURL = "http://127.0.0.1:80"
+	if err := proxy.WaitForAdmin(ctx, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -41,15 +44,15 @@ func TestRealCaddyGraceRollback(t *testing.T) {
 	upNew := strings.TrimPrefix(nw.URL, "http://")
 	running := func() (bool, error) { return true, nil }
 
-	setUpstream(ctx, upOld)
-	setUpstream(ctx, upNew)
-	if err := waitUntil(ctx, postCutoverHealth, proxyPublicURL+"/health", servedBy(upNew), running); err != nil {
+	proxy.SetUpstream(ctx, upOld)
+	proxy.SetUpstream(ctx, upNew)
+	if err := health.WaitUntil(ctx, postCutoverHealth, proxy.PublicURL+"/health", health.ServedBy(proxy.UpstreamHeader, upNew), running); err != nil {
 		t.Fatal(err)
 	}
 
 	time.AfterFunc(1*time.Second, nw.Close) // new version dies mid-window
 	start := time.Now()
-	err := watch(ctx, postCutoverHealth, proxyPublicURL+"/health", servedBy(upNew), running, 30*time.Second, 3)
+	err := health.Watch(ctx, postCutoverHealth, proxy.PublicURL+"/health", health.ServedBy(proxy.UpstreamHeader, upNew), running, 30*time.Second, 3)
 	if err == nil {
 		t.Fatal("watch should fail when the new version dies")
 	}
@@ -61,10 +64,10 @@ func TestRealCaddyGraceRollback(t *testing.T) {
 	if s, _ := d.Snapshot(); s != StatusRolledBack {
 		t.Fatalf("status = %s, want rolled_back", s)
 	}
-	if up, _ := currentUpstream(ctx); up != upOld {
+	if up, _ := proxy.CurrentUpstream(ctx); up != upOld {
 		t.Fatalf("proxy points at %q, want old %q", up, upOld)
 	}
-	if err := waitUntil(ctx, postCutoverHealth, proxyPublicURL+"/health", servedBy(upOld), running); err != nil {
+	if err := health.WaitUntil(ctx, postCutoverHealth, proxy.PublicURL+"/health", health.ServedBy(proxy.UpstreamHeader, upOld), running); err != nil {
 		t.Fatalf("old version not serving after rollback: %v", err)
 	}
 }

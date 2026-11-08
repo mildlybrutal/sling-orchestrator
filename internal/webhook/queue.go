@@ -1,8 +1,10 @@
-package main
+package webhook
 
 import (
 	"log"
 	"sync"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
 )
 
 // deployQueue runs deploys one at a time and keeps at most one waiting.
@@ -11,16 +13,16 @@ import (
 // to be replaced. The deploy already running is never interrupted.
 type deployQueue struct {
 	mu      sync.Mutex
-	pending *Deployment
+	pending *deploy.Deployment
 	wake    chan struct{} // capacity 1: "there may be work"
-	run     func(*Deployment)
+	run     func(*deploy.Deployment)
 }
 
-func newDeployQueue(run func(*Deployment)) *deployQueue {
+func newDeployQueue(run func(*deploy.Deployment)) *deployQueue {
 	return &deployQueue{wake: make(chan struct{}, 1), run: run}
 }
 
-func (q *deployQueue) submit(d *Deployment) {
+func (q *deployQueue) submit(d *deploy.Deployment) {
 	q.mu.Lock()
 	old := q.pending
 	if old != nil && old.CommitSHA == d.CommitSHA {
@@ -32,7 +34,7 @@ func (q *deployQueue) submit(d *Deployment) {
 	q.mu.Unlock()
 
 	if old != nil {
-		old.setStatus(StatusSuperseded)
+		old.SetStatus(deploy.StatusSuperseded)
 		log.Printf("%s superseded by %s before it started", old.CommitSHA[:7], d.CommitSHA[:7])
 	}
 	select {
@@ -41,7 +43,7 @@ func (q *deployQueue) submit(d *Deployment) {
 	}
 }
 
-func (q *deployQueue) take() *Deployment {
+func (q *deployQueue) take() *deploy.Deployment {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	d := q.pending

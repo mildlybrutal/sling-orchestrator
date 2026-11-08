@@ -1,4 +1,4 @@
-package main
+package webhook
 
 import (
 	"crypto/hmac"
@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
 )
 
 var testCfg = webhookConfig{
@@ -30,10 +32,10 @@ func pushBody(repo, ref, after string, deleted bool) string {
 }
 
 // send posts body to a handler and returns the status and what was queued.
-func send(t *testing.T, method, event, sig, body string) (int, []*Deployment) {
+func send(t *testing.T, method, event, sig, body string) (int, []*deploy.Deployment) {
 	t.Helper()
-	var got []*Deployment
-	h := &webhookHandler{cfg: testCfg, submit: func(d *Deployment) { got = append(got, d) }}
+	var got []*deploy.Deployment
+	h := &webhookHandler{cfg: testCfg, submit: func(d *deploy.Deployment) { got = append(got, d) }}
 	req := httptest.NewRequest(method, "/webhook", strings.NewReader(body))
 	if event != "" {
 		req.Header.Set("X-GitHub-Event", event)
@@ -119,23 +121,6 @@ func TestWebhookMethodAndSize(t *testing.T) {
 	}
 }
 
-func TestValidateRepoURLLocalOnlyFromCLI(t *testing.T) {
-	if err := validateRepoURL("../sling", true); err != nil {
-		t.Fatalf("CLI local path should be allowed: %v", err)
-	}
-	if err := validateRepoURL("../sling", false); err == nil {
-		t.Fatal("local path must be refused for webhook deploys")
-	}
-	for _, bad := range []string{"http://github.com/a/b", "https://evil.com/a/b", "file:///etc", "-upload-pack=x"} {
-		if err := validateRepoURL(bad, false); err == nil {
-			t.Errorf("%q should be refused", bad)
-		}
-	}
-	if err := validateRepoURL("https://github.com/akash/sling.git", false); err != nil {
-		t.Fatalf("github https should pass: %v", err)
-	}
-}
-
 func TestLoadWebhookConfig(t *testing.T) {
 	t.Setenv("SLING_WEBHOOK_SECRET", "short")
 	t.Setenv("SLING_REPO", "akash/sling")
@@ -161,7 +146,7 @@ func TestQueueLatestPushWins(t *testing.T) {
 	started := make(chan string, 10)
 	var mu sync.Mutex
 	var ran []string
-	q := newDeployQueue(func(d *Deployment) {
+	q := newDeployQueue(func(d *deploy.Deployment) {
 		started <- d.CommitSHA
 		<-release
 		mu.Lock()
@@ -172,7 +157,7 @@ func TestQueueLatestPushWins(t *testing.T) {
 	done := make(chan struct{})
 	go func() { q.worker(stop); close(done) }()
 
-	a, b, c := &Deployment{CommitSHA: sha("a")}, &Deployment{CommitSHA: sha("b")}, &Deployment{CommitSHA: sha("c")}
+	a, b, c := &deploy.Deployment{CommitSHA: sha("a")}, &deploy.Deployment{CommitSHA: sha("b")}, &deploy.Deployment{CommitSHA: sha("c")}
 	q.submit(a)
 	<-started // A is building
 	q.submit(b)
@@ -185,7 +170,7 @@ func TestQueueLatestPushWins(t *testing.T) {
 	close(stop)
 	<-done
 
-	if s, _ := b.Snapshot(); s != StatusSuperseded {
+	if s, _ := b.Snapshot(); s != deploy.StatusSuperseded {
 		t.Fatalf("B status %q, want superseded", s)
 	}
 	if len(ran) != 2 || ran[0] != sha("a") || ran[1] != sha("c") {
@@ -196,17 +181,17 @@ func TestQueueLatestPushWins(t *testing.T) {
 func TestQueueSameCommitQueuedOnce(t *testing.T) {
 	release := make(chan struct{})
 	count := make(chan string, 10)
-	q := newDeployQueue(func(d *Deployment) { count <- d.CommitSHA; <-release })
+	q := newDeployQueue(func(d *deploy.Deployment) { count <- d.CommitSHA; <-release })
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { q.worker(stop); close(done) }()
 
-	q.submit(&Deployment{CommitSHA: sha("a")})
+	q.submit(&deploy.Deployment{CommitSHA: sha("a")})
 	<-count
-	first := &Deployment{CommitSHA: sha("b")}
+	first := &deploy.Deployment{CommitSHA: sha("b")}
 	q.submit(first)
-	q.submit(&Deployment{CommitSHA: sha("b")}) // GitHub redelivery
-	if s, _ := first.Snapshot(); s == StatusSuperseded {
+	q.submit(&deploy.Deployment{CommitSHA: sha("b")}) // GitHub redelivery
+	if s, _ := first.Snapshot(); s == deploy.StatusSuperseded {
 		t.Fatal("a duplicate must not supersede the identical queued deploy")
 	}
 	release <- struct{}{}
@@ -225,12 +210,12 @@ func TestQueueStopFinishesCurrentDeploy(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
 	finished := false
-	q := newDeployQueue(func(d *Deployment) { started <- struct{}{}; <-release; finished = true })
+	q := newDeployQueue(func(d *deploy.Deployment) { started <- struct{}{}; <-release; finished = true })
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { q.worker(stop); close(done) }()
 
-	q.submit(&Deployment{CommitSHA: sha("a")})
+	q.submit(&deploy.Deployment{CommitSHA: sha("a")})
 	<-started
 	close(stop)
 	select {
@@ -244,3 +229,5 @@ func TestQueueStopFinishesCurrentDeploy(t *testing.T) {
 		t.Fatal("the running deploy must complete before the worker stops")
 	}
 }
+
+func sha(c string) string { return strings.Repeat(c, 40) }

@@ -1,4 +1,4 @@
-package main
+package deploy
 
 import (
 	"fmt"
@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/run"
 )
 
 const keepImages = 3
@@ -20,13 +22,13 @@ func prune(liveUpstream, prevUpstream string) {
 	live := upstreamContainer(liveUpstream)
 	prev := upstreamContainer(prevUpstream)
 
-	names, err := runCaptureCmd(dockerTimeout, "", "docker", "ps", "-a",
+	names, err := run.Capture(dockerTimeout, "", "docker", "ps", "-a",
 		"--filter", "label=sling.managed=true", "--format", "{{.Names}}")
 	if err != nil {
 		fmt.Printf("prune : could not list containers: %v\n", err)
 	} else {
 		for _, name := range containersToRemove(lines(names), live, prev) {
-			if _, err := runCaptureCmd(cleanupTimeout, "", "docker", "rm", "-f", name); err != nil {
+			if _, err := run.Capture(cleanupTimeout, "", "docker", "rm", "-f", name); err != nil {
 				fmt.Printf("prune: could not remove %s: %v\n", name, err)
 			} else {
 				fmt.Printf("Pruned container %s\n", name)
@@ -34,7 +36,7 @@ func prune(liveUpstream, prevUpstream string) {
 		}
 	}
 
-	imgs, err := runCaptureCmd(dockerTimeout, "", "docker", "images", "paas-app",
+	imgs, err := run.Capture(dockerTimeout, "", "docker", "images", "paas-app",
 		"--format", "{{.CreatedAt}}\t{{.Tag}}")
 	if err != nil {
 		fmt.Printf("prune: could not list images: %v\n", err)
@@ -47,7 +49,7 @@ func prune(liveUpstream, prevUpstream string) {
 		}
 	}
 	for _, tag := range imagesToRemove(lines(imgs), inUse, keepImages) {
-		if _, err := runCaptureCmd(cleanupTimeout, "", "docker", "rmi", "paas-app:"+tag); err != nil {
+		if _, err := run.Capture(cleanupTimeout, "", "docker", "rmi", "paas-app:"+tag); err != nil {
 			fmt.Printf("⚠️  prune: could not remove image paas-app:%s: %v\n", tag[:7], err)
 		} else {
 			fmt.Printf("Pruned image paas-app:%s\n", tag[:7])

@@ -1,4 +1,4 @@
-package main
+package webhook
 
 import (
 	"context"
@@ -9,11 +9,14 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/mildlybrutal/sling-orchestrator/internal/deploy"
+	"github.com/mildlybrutal/sling-orchestrator/internal/proxy"
 )
 
-// serve runs Sling as a webhook server: a push to the configured branch of
+// Serve runs Sling as a webhook server: a push to the configured branch of
 // the configured repo deploys that commit.
-func serve() error {
+func Serve() error {
 	cfg, err := loadWebhookConfig()
 	if err != nil {
 		return err
@@ -67,18 +70,18 @@ func serve() error {
 	return nil
 }
 
-func deployAndLog(d *Deployment) {
+func deployAndLog(d *deploy.Deployment) {
 	sha := d.CommitSHA[:7]
 	log.Printf("deploying %s", sha)
-	err := runPipeline(d)
+	err := deploy.Run(d)
 	switch {
-	case errors.Is(err, errAlreadyLive):
+	case errors.Is(err, deploy.ErrAlreadyLive):
 		log.Printf("%s is already live, nothing to do", sha)
 		return
 	case err != nil:
 		log.Printf("deploy %s failed: %v", sha, err)
 	default:
-		log.Printf("deploy %s is live at %s", sha, proxyPublicURL)
+		log.Printf("deploy %s is live at %s", sha, proxy.PublicURL)
 	}
-	d.printTimeline()
+	d.PrintTimeline()
 }

@@ -1,4 +1,4 @@
-package main
+package deploy
 
 import (
 	"fmt"
@@ -29,7 +29,7 @@ type StatusChange struct {
 	At     time.Time
 }
 
-func (d *Deployment) setStatus(s Status) {
+func (d *Deployment) SetStatus(s Status) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.status = s
@@ -45,7 +45,7 @@ func (d *Deployment) Snapshot() (Status, []StatusChange) {
 	return d.status, h
 }
 
-func (d *Deployment) printTimeline() {
+func (d *Deployment) PrintTimeline() {
 	_, h := d.Snapshot()
 	if len(h) == 0 {
 		return
