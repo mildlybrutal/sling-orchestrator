@@ -31,6 +31,12 @@ const usage = `usage:
 
 func main() {
 	log.SetFlags(0) // CLI errors read better without a timestamp
+	ps, err := proxy.LoadSettings()
+	if err != nil {
+		log.Fatal(err)
+	}
+	proxy.Configure(ps)
+
 	args := os.Args[1:]
 	switch {
 	case len(args) == 1 && args[0] == "serve":

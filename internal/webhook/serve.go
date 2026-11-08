@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -48,22 +49,37 @@ func Serve() error {
 
 	submit := func(d *deploy.Deployment) { q.submit(d) }
 
+	hook := &webhookHandler{cfg: cfg, submit: submit}
 	mux := http.NewServeMux()
-	mux.Handle("/webhook", &webhookHandler{cfg: cfg, submit: submit})
+	mux.Handle("/webhook", hook)
 	mux.Handle("/deploys", &deploysHandler{token: cfg.StatusToken, recent: store.Recent, live: proxy.CurrentUpstream})
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	servers := []*http.Server{newServer(cfg.Listen, mux)}
+
+	// Public mode: Caddy forwards https://<domain>/webhook to the sling-net
+	// gateway (the host as containers see it). That listener serves
+	// /webhook only, so /deploys is never one proxy hop from the internet.
+	if proxy.Current().Public() {
+		if err := proxy.Ensure(context.Background()); err != nil {
+			return fmt.Errorf("proxy: %w", err)
+		}
+		addr, err := proxy.WebhookListenAddr()
+		if err != nil {
+			return err
+		}
+		public := http.NewServeMux()
+		public.Handle("/webhook", hook)
+		servers = append(servers, newServer(addr, public))
+		log.Printf("public webhook: %s/webhook (Caddy → %s)", proxy.PublicURL, addr)
 	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	errc := make(chan error, 1)
+	errc := make(chan error, len(servers))
+	for _, s := range servers[1:] {
+		go func(s *http.Server) { errc <- s.ListenAndServe() }(s)
+	}
+	srv := servers[0]
 	go func() {
 		log.Printf("Sling listening on http://%s/webhook (repo %s, branch %s)", cfg.Listen, cfg.Repo, cfg.Branch)
 		if len(cfg.StatusToken) > 0 {
@@ -87,7 +103,9 @@ func Serve() error {
 	log.Println("shutting down: refusing new webhooks, finishing any deploy in progress (Ctrl-C again to force)")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	for _, s := range servers {
+		_ = s.Shutdown(shutdownCtx)
+	}
 	close(stop)
 	<-workerDone
 	log.Println("stopped")
@@ -108,4 +126,15 @@ func deployAndLog(d *deploy.Deployment) {
 		log.Printf("deploy %s is live at %s", sha, proxy.PublicURL)
 	}
 	d.PrintTimeline()
+}
+
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 }

@@ -15,6 +15,10 @@ type Config struct {
 	Deadline       time.Duration
 	RequestTimeout time.Duration
 	RequiredStreak int
+
+	// Transport, if set, carries the probes (nil = Go's default). The proxy
+	// uses it to send checks for an HTTPS domain to the local Caddy.
+	Transport http.RoundTripper
 }
 
 var Default = Config{
@@ -70,10 +74,7 @@ func WaitUntil(ctx context.Context, cfg Config, url string, pass Check, isRunnin
 	ctx, cancel := context.WithTimeout(ctx, cfg.Deadline)
 	defer cancel()
 
-	client := &http.Client{
-		Timeout:       cfg.RequestTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := newProbeClient(cfg)
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -175,6 +176,7 @@ func Watch(ctx context.Context, cfg Config, url string, pass Check, isRunning fu
 
 func newProbeClient(cfg Config) *http.Client {
 	return &http.Client{
+		Transport:     cfg.Transport,
 		Timeout:       cfg.RequestTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	}

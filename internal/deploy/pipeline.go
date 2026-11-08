@@ -259,8 +259,11 @@ func release(ctx context.Context, d *Deployment) error {
 	// the NEW container answered (Caddy reports which upstream did). This
 	// catches what the direct check can't: Caddy unable to reach the
 	// container on sling-net, or still routing to the old one.
+	viaProxy := postCutoverHealth
+	viaProxy.Transport = proxy.ProbeTransport()
+	probeURL := proxy.ProbeURL() + "/health"
 	fmt.Printf("Verifying through the proxy (%s)...\n", proxy.PublicURL)
-	if err := health.WaitUntil(ctx, postCutoverHealth, proxy.PublicURL+"/health", health.ServedBy(proxy.UpstreamHeader, upstream), isRunning); err != nil {
+	if err := health.WaitUntil(ctx, viaProxy, probeURL, health.ServedBy(proxy.UpstreamHeader, upstream), isRunning); err != nil {
 		return rollback(ctx, d, prev, fmt.Errorf("post-cutover check failed: %w", err))
 	}
 
@@ -268,7 +271,7 @@ func release(ctx context.Context, d *Deployment) error {
 	// falls over now, rolling back is a single proxy switch.
 	d.SetStatus(StatusObserving)
 	fmt.Printf("Observing for %v before retiring the previous version...\n", graceWindow)
-	if err := health.Watch(ctx, postCutoverHealth, proxy.PublicURL+"/health", health.ServedBy(proxy.UpstreamHeader, upstream),
+	if err := health.Watch(ctx, viaProxy, probeURL, health.ServedBy(proxy.UpstreamHeader, upstream),
 		isRunning, graceWindow, graceMaxFailures); err != nil {
 		return rollback(ctx, d, prev, fmt.Errorf("failed during grace window: %w", err))
 	}

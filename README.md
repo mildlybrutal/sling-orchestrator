@@ -46,6 +46,8 @@ VPS that you own.
 | **Live commit is not redeployed** | Redeploying the commit that is already live is skipped before any container is touched. |
 | **Only signed pushes deploy** | Webhook deliveries must carry a valid HMAC-SHA256 signature, and come from the configured repo and branch. The clone URL comes from Sling's own config, never from the payload. |
 | **Bursts of pushes don't pile up** | Deploys run one at a time with at most one waiting. A newer push replaces the waiting one. |
+| **HTTPS with no certificate work** | With `SLING_DOMAIN` set, Caddy obtains and renews a Let's Encrypt certificate itself, redirects HTTP to HTTPS, and forwards only `/webhook` to Sling. The admin API stays on loopback. |
+| **A config mistake can't reconfigure a live site** | The proxy container records the settings it was created with. A `sling` command run with different ones (say, without `SLING_DOMAIN`) is refused before anything changes. |
 
 ## Who it is for
 
@@ -61,7 +63,8 @@ VPS that you own.
 | Footprint | one Go binary + Caddy | Ruby gem + kamal-proxy | dashboard + DB + workers | Bash + nginx plugins |
 | Confirms the new version answers through the proxy | ✅ | partial | — | — |
 | Automatic rollback during a grace window | ✅ | — | — | — |
-| Web UI, TLS, multiple apps | roadmap | ✅ | ✅ | ✅ |
+| Automatic HTTPS | ✅ | ✅ | ✅ | ✅ |
+| Web UI, multiple apps | roadmap | ✅ | ✅ | ✅ |
 
 Sling's aim is to be **the smallest tool with the strongest rollback guarantees**,
 not the one with the most features.
@@ -97,9 +100,10 @@ flowchart LR
     sling -->|docker build / run / stop| docker
     sling -->|"admin API :2019<br/>POST /load, GET /config"| caddy
     sling -.->|"direct health probes<br/>127.0.0.1:{random port}/health"| green
-    sling -.->|"proxy probes<br/>127.0.0.1:8080/health"| caddy
+    sling -.->|"proxy probes<br/>(local caddy, as the domain)"| caddy
+    caddy -.->|"/webhook only<br/>(sling-net gateway)"| sling
 
-    users -->|"127.0.0.1:8080"| caddy
+    users -->|"https://{domain}<br/>(or 127.0.0.1:8080 locally)"| caddy
     caddy -->|"before cutover"| blue
     caddy ==>|"after cutover"| green
 ```
@@ -114,7 +118,9 @@ flowchart LR
   and a deploy that is running always finishes, even during shutdown.
 - **Proxy control** (`internal/proxy`): makes sure `sling-net` and the `sling-caddy`
   container exist. It builds the Caddy JSON config and swaps the upstream
-  in one step through the admin API.
+  in one step through the admin API. Two modes: local (HTTP on `127.0.0.1:8080`)
+  and public (HTTPS for `SLING_DOMAIN`, with automatic certificates and a
+  `/webhook` route to `sling serve`).
 - **Health gate** (`internal/health`): `WaitUntil` (N passes in a row before a
   deadline) and `watch` (fail after N failures in a row during a window).
 - **Status tracking** (`internal/deploy/status.go`): a status machine guarded by a mutex, with a
@@ -264,7 +270,7 @@ ask whether the container is still running.
 | Post-cutover check | every 500ms, 3 passes in a row, 10s deadline | `postCutoverHealth` (internal/deploy) |
 | Grace window | 30s, roll back after 3 failures in a row | `graceWindow`, `graceMaxFailures` (internal/deploy) |
 | Timeouts | clone 1m, git 30s, build 10m, docker 30s | internal/deploy |
-| Public proxy | `127.0.0.1:8080` | internal/proxy |
+| Public proxy | `127.0.0.1:8080` (local) or `:80`/`:443` for `SLING_DOMAIN` | internal/proxy |
 | Caddy admin | `127.0.0.1:2019` | internal/proxy |
 | App container port | `3000` (published on a random loopback port) | internal/proxy |
 
@@ -381,13 +387,57 @@ curl -H "Authorization: Bearer $SLING_STATUS_TOKEN" http://127.0.0.1:9000/deploy
 ```
 
 In the GitHub repo, go to **Settings → Webhooks → Add webhook** and set:
-- **Payload URL:** `https://<your-host>/webhook`
+- **Payload URL:** `https://<SLING_DOMAIN>/webhook`
 - **Content type:** `application/json`
 - **Secret:** the same `SLING_WEBHOOK_SECRET`
 - **Events:** just the push event
 
-The default listen address is loopback, so GitHub can't reach it directly. Put
-a tunnel (cloudflared, ngrok) or a public HTTPS reverse proxy in front of it.
+Without `SLING_DOMAIN` (local mode), the webhook listens on loopback only, so
+GitHub can't reach it: use public mode (below) or a tunnel such as cloudflared.
+
+### Going public: HTTPS on your domain
+
+```bash
+export SLING_DOMAIN=app.example.com     # DNS A/AAAA record must point at this server
+export SLING_ACME_EMAIL=you@example.com # optional: Let's Encrypt expiry warnings
+./bin/sling serve                       # or any deploy; the first one sets up the proxy
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SLING_DOMAIN` | unset (local mode) | The one hostname to serve over HTTPS |
+| `SLING_TLS` | `acme` | `acme` = Let's Encrypt; `internal` = Caddy's own CA (testing, browsers warn) |
+| `SLING_ACME_EMAIL` | unset | Contact address for the certificate account |
+| `SLING_WEBHOOK_PORT` | `9000` | Port `sling serve` listens on for Caddy, on the `sling-net` gateway |
+| `SLING_PUBLIC_BIND` | `0.0.0.0` | Host address for ports 80/443 (`127.0.0.1` to test without exposing them) |
+
+What changes in public mode:
+- **Caddy listens on 80 and 443.** It gets the certificate on first request and renews it.
+  HTTP redirects to HTTPS (308). Certificates live in the `sling-caddy-data` volume,
+  so recreating the container doesn't request new ones (Let's Encrypt rate-limits that).
+- **`https://<domain>/webhook` goes to Sling**, everything else to the app.
+  `sling serve` gets a second listener on the `sling-net` gateway (the host as
+  containers see it) that serves **only** `/webhook`. `/deploys` stays on
+  `SLING_LISTEN` (loopback), never one hop from the internet.
+- **Sling's own checks still go through Caddy**: they connect to the local proxy with the
+  domain as SNI and Host, so they work before DNS points here, and still require
+  `X-Sling-Upstream` to name the new container. They skip certificate verification
+  on that loopback connection on purpose: the check is about routing, and a
+  certificate problem must not roll back a healthy app.
+- **Every `sling` command must see the same settings.** Put them in one env file.
+  To change mode on purpose: `docker rm -f sling-caddy` (the site is down until the
+  next deploy; certificates are kept).
+
+The server needs ports 80 and 443 open to the internet (80 for the certificate
+challenge and redirect). The admin API (2019) stays bound to loopback in every mode.
+
+Try public mode on your laptop without a domain:
+
+```bash
+SLING_DOMAIN=sling.localhost SLING_TLS=internal SLING_PUBLIC_BIND=127.0.0.1 \
+  ./bin/sling ../sling $(git -C ../sling rev-parse good-v1)
+curl -k --resolve sling.localhost:443:127.0.0.1 https://sling.localhost/
+```
 
 Webhook deploys always clone `https://github.com/$SLING_REPO.git`; local paths
 are only accepted from the CLI. The first Ctrl-C (or SIGTERM) stops accepting
@@ -423,5 +473,5 @@ make e2e                                    # end to end: deploys every demo cas
 - [x] One deploy at a time per host, across processes (file lock)
 - [x] Persistent deploy history (SQLite), `sling history`, crash detection (`interrupted`)
 - [ ] Dashboard
-- [ ] TLS through Caddy's automatic HTTPS
+- [x] HTTPS through Caddy's automatic certificates, with `/webhook` routed to Sling
 - [x] Cleanup of old containers, images and build folders

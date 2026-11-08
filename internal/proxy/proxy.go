@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -31,6 +32,17 @@ const (
 	adminHostPort  = "2019"
 	httpServerName = "sling"
 
+	// appRouteID tags the handler that serves the app (or the 503 page), so
+	// Sling can find it in any config shape: GET /id/sling_app/...
+	appRouteID = "sling_app"
+
+	// Caddy keeps certificates and ACME account keys in /data. A named
+	// volume keeps them when the container is recreated, so Sling never
+	// re-requests certificates it already has (Let's Encrypt rate-limits that).
+	dataVolume = "sling-caddy-data"
+	// The label holding Settings.fingerprint() on the proxy container.
+	settingsLabel = "sling.proxy"
+
 	proxyStartTimeout = 3 * time.Minute
 	dockerTimeout     = 30 * time.Second
 )
@@ -42,12 +54,15 @@ var (
 	adminClient = &http.Client{Timeout: 10 * time.Second}
 )
 
-// BuildConfig returns the whole Caddy JSON config for upstream.
+// BuildConfig returns the whole Caddy JSON config for upstream, in the mode
+// set by Configure. POST /load replaces everything, so every config carries
+// the admin block, the TLS policy and the webhook route.
 func BuildConfig(upstream string) ([]byte, error) {
 	var handler map[string]any
 
 	if upstream == "" {
 		handler = map[string]any{
+			"@id":         appRouteID,
 			"handler":     "static_response",
 			"status_code": 503,
 			"body":        "sling: no app deployed yet\n",
@@ -55,6 +70,7 @@ func BuildConfig(upstream string) ([]byte, error) {
 
 	} else {
 		handler = map[string]any{
+			"@id":       appRouteID,
 			"handler":   "reverse_proxy",
 			"upstreams": []any{map[string]any{"dial": upstream}},
 			"headers": map[string]any{
@@ -67,26 +83,66 @@ func BuildConfig(upstream string) ([]byte, error) {
 		}
 	}
 
-	cfg := map[string]any{
-		"admin": map[string]any{
-			"listen":  adminListen,
-			"origins": []string{"localhost:" + adminHostPort, "127.0.0.1:" + adminHostPort},
-		},
-		"apps": map[string]any{
-			"http": map[string]any{
-				"servers": map[string]any{
-					httpServerName: map[string]any{
-						"listen":          []string{":80"},
-						"automatic_https": map[string]any{"disable": true},
-						"routes": []any{
-							map[string]any{"handle": []any{handler}},
-						},
-					},
-				},
-			},
-		},
+	admin := map[string]any{
+		"listen":  adminListen,
+		"origins": []string{"localhost:" + adminHostPort, "127.0.0.1:" + adminHostPort},
 	}
-	return json.Marshal(cfg)
+	appRoute := map[string]any{"handle": []any{handler}}
+
+	if !settings.Public() {
+		return json.Marshal(map[string]any{
+			"admin": admin,
+			"apps": map[string]any{"http": map[string]any{"servers": map[string]any{
+				httpServerName: map[string]any{
+					"listen":          []string{":80"},
+					"automatic_https": map[string]any{"disable": true},
+					"routes":          []any{appRoute},
+				},
+			}}},
+		})
+	}
+
+	if gatewayIP == "" {
+		return nil, fmt.Errorf("public mode needs sling-net's gateway: call proxy.Ensure first")
+	}
+	// Public: HTTPS on 443 for exactly one host. Caddy's automatic HTTPS sees
+	// the host matcher, obtains a certificate for it, and adds the :80
+	// listener itself (ACME HTTP challenge + redirect to https).
+	webhookRoute := map[string]any{
+		"match": []any{map[string]any{"path": []string{"/webhook"}}},
+		"handle": []any{map[string]any{
+			"handler":   "reverse_proxy",
+			"upstreams": []any{map[string]any{"dial": net.JoinHostPort(gatewayIP, settings.WebhookPort)}},
+		}},
+	}
+	issuer := map[string]any{"module": "internal"}
+	if settings.TLS == TLSACME {
+		issuer = map[string]any{"module": "acme"}
+		if settings.Email != "" {
+			issuer["email"] = settings.Email
+		}
+	}
+	return json.Marshal(map[string]any{
+		"admin": admin,
+		"apps": map[string]any{
+			"http": map[string]any{"servers": map[string]any{
+				httpServerName: map[string]any{
+					"listen": []string{":443"},
+					"routes": []any{map[string]any{
+						"match": []any{map[string]any{"host": []string{settings.Domain}}},
+						"handle": []any{map[string]any{
+							"handler": "subroute",
+							"routes":  []any{webhookRoute, appRoute},
+						}},
+						"terminal": true,
+					}},
+				},
+			}},
+			"tls": map[string]any{"automation": map[string]any{"policies": []any{
+				map[string]any{"subjects": []string{settings.Domain}, "issuers": []any{issuer}},
+			}}},
+		},
+	})
 }
 
 func caddyLoad(ctx context.Context, cfg []byte) error {
@@ -121,31 +177,46 @@ func SetUpstream(ctx context.Context, upstream string) error {
 }
 
 // CurrentUpstream returns what Caddy is routing to now, or "" for the 503 page.
+// It finds the app handler by its @id, so it works in every mode. A config
+// written before handlers had an @id (a proxy from an older Sling, kept by
+// --resume) has none, so it falls back to the old fixed path once.
 func CurrentUpstream(ctx context.Context) (string, error) {
-	url := caddyAdminURL + "/config/apps/http/servers/" + httpServerName + "/routes/0/handle/0/upstreams/0/dial"
+	dial, found, err := readDial(ctx, caddyAdminURL+"/id/"+appRouteID+"/upstreams/0/dial")
+	if err != nil || found {
+		return dial, err
+	}
+	dial, _, err = readDial(ctx, caddyAdminURL+"/config/apps/http/servers/"+httpServerName+"/routes/0/handle/0/upstreams/0/dial")
+	return dial, err
+}
+
+// readDial GETs one dial value. found is false when the admin API says the
+// path or ID doesn't exist (404); a 400 means the handler exists but has no
+// upstream, which is the 503 page: found, nothing live.
+func readDial(ctx context.Context, url string) (dial string, found bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	resp, err := adminClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("caddy admin API unreachable: %w", err)
+		return "", false, fmt.Errorf("caddy admin API unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		var dial string
 		if err := json.Unmarshal(body, &dial); err != nil {
-			return "", fmt.Errorf("unexpected upstream value %q: %w", strings.TrimSpace(string(body)), err)
+			return "", true, fmt.Errorf("unexpected upstream value %q: %w", strings.TrimSpace(string(body)), err)
 		}
-		return dial, nil
+		return dial, true, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return "", false, nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		// The path does not exist: the config has no upstream (503 page).
-		return "", nil
+		// The handler has no upstreams: the 503 page.
+		return "", true, nil
 	default:
-		return "", fmt.Errorf("caddy admin API: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", true, fmt.Errorf("caddy admin API: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 }
 
@@ -166,8 +237,29 @@ func Ensure(ctx context.Context) error {
 	if err := ensureNetwork(); err != nil {
 		return err
 	}
+	if settings.Public() {
+		out, err := run.Capture(dockerTimeout, "", "docker", "network", "inspect", NetworkName,
+			"-f", "{{range .IPAM.Config}}{{.Gateway}} {{end}}")
+		if err != nil {
+			return fmt.Errorf("reading %s gateway: %w", NetworkName, err)
+		}
+		if gatewayIP, err = lookupGateway(out); err != nil {
+			return fmt.Errorf("reading %s gateway: %w", NetworkName, err)
+		}
+	}
 
-	state, err := run.Capture(dockerTimeout, "", "docker", "inspect", "-f", "{{.State.Status}}", proxyName)
+	out, err := run.Capture(dockerTimeout, "", "docker", "inspect", "-f",
+		`{{.State.Status}}|{{index .Config.Labels "`+settingsLabel+`"}}`, proxyName)
+	state, label, _ := strings.Cut(out, "|")
+	if label == "" {
+		label = "local" // created by a Sling from before this label existed
+	}
+	if err == nil && label != settings.fingerprint() {
+		return fmt.Errorf("proxy %s was set up as %q, but this command has %q.\n"+
+			"Use the same SLING_DOMAIN / SLING_TLS / SLING_ACME_EMAIL / SLING_WEBHOOK_PORT / SLING_PUBLIC_BIND for every sling command,\n"+
+			"or, to change mode on purpose: docker rm -f %s (the site is down until the next deploy; certificates are kept in volume %s)",
+			proxyName, label, settings.fingerprint(), proxyName, dataVolume)
+	}
 	switch {
 	case err != nil:
 		// Not created yet: start it with a "no app yet" config.
@@ -176,16 +268,31 @@ func Ensure(ctx context.Context) error {
 			return err
 		}
 		fmt.Printf("Starting proxy container %s (first run pulls %s)...\n", proxyName, proxyImage)
-		_, err = run.Capture(proxyStartTimeout, "", "docker", "run", "-d",
+		args := []string{"run", "-d",
 			"--name", proxyName,
 			"--restart", "unless-stopped",
 			"--network", NetworkName,
-			"-p", fmt.Sprintf("%s:%s:80", proxyBind, proxyHostPort),
+			"--label", settingsLabel + "=" + settings.fingerprint(),
+			"-v", dataVolume + ":/data",
+			// The admin API can rewrite all routing: loopback only, in every mode.
 			"-p", fmt.Sprintf("127.0.0.1:%s:%s", adminHostPort, adminHostPort),
+		}
+		if settings.Public() {
+			b := settings.Bind
+			args = append(args,
+				"-p", net.JoinHostPort(b, "80")+":80",
+				"-p", net.JoinHostPort(b, "443")+":443",
+				"-p", net.JoinHostPort(b, "443")+":443/udp", // HTTP/3
+			)
+		} else {
+			args = append(args, "-p", fmt.Sprintf("%s:%s:80", proxyBind, proxyHostPort))
+		}
+		args = append(args,
 			"-e", "SLING_BOOT="+string(boot),
 			proxyImage,
 			"sh", "-c", `printf %s "$SLING_BOOT" > /tmp/boot.json && exec caddy run --config /tmp/boot.json --resume`,
 		)
+		_, err = run.Capture(proxyStartTimeout, "", "docker", args...)
 		if err != nil {
 			return fmt.Errorf("starting proxy: %w", err)
 		}
