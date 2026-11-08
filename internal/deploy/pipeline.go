@@ -13,17 +13,58 @@ import (
 	"github.com/mildlybrutal/sling-orchestrator/internal/run"
 )
 
-// Run wraps pipeline so that any failure, from any stage, is
-// recorded in one place. A deploy that was rolled back keeps that status
-// instead of being overwritten with plain "failed", and one whose commit was
-// already live is "skipped".
+// A deploy is two halves joined only by an image tag:
+//
+//	build   : source code -> image paas-app:<sha>   (no effect on users)
+//	release : image -> live, safely                 (all the risk, all the checks)
+//
+// A deploy is build + release. A rollback will be release alone, on an image
+// that already exists, so it gets every health check and the grace window
+// without a second copy of that logic.
+
+// Run deploys d.CommitSHA from d.RepoURL: build, then release.
 func Run(d *Deployment) error {
+	return locked(d, func(ctx context.Context) error {
+		if !shaPattern.MatchString(d.CommitSHA) {
+			return fmt.Errorf("invalid commit SHA %q: must be 40 lowercase hex characters", d.CommitSHA)
+		}
+		if err := ValidateRepoURL(d.RepoURL, d.AllowLocalRepo); err != nil {
+			return err
+		}
+		if err := prepare(ctx, d); err != nil {
+			return err
+		}
+		// Cheap early exit: don't spend minutes building a commit that is
+		// already live. release checks again; that check is the one that counts.
+		if err := refuseIfLive(ctx, d.CommitSHA); err != nil {
+			return err
+		}
+		if err := build(d); err != nil {
+			return err
+		}
+		return release(ctx, d)
+	})
+}
+
+// locked runs fn holding the deploy lock, and records the final status in
+// one place for every failure. A deploy that was rolled back keeps that
+// status instead of plain "failed", and one whose commit was already live
+// is "skipped".
+func locked(d *Deployment, fn func(ctx context.Context) error) error {
 	d.SetStatus(StatusQueued)
 
+	// In-process first (cheap, and keeps goroutines in "sling serve" in
+	// order), then the file lock, which also covers other Sling processes.
 	deployMu.Lock()
 	defer deployMu.Unlock()
+	unlock, err := acquireLock(lockPath())
+	if err != nil {
+		d.SetStatus(StatusFailed)
+		return err
+	}
+	defer unlock()
 
-	if err := pipeline(d); err != nil {
+	if err := fn(context.Background()); err != nil {
 		switch s, _ := d.Snapshot(); {
 		case errors.Is(err, ErrAlreadyLive):
 			d.SetStatus(StatusSkipped)
@@ -35,46 +76,48 @@ func Run(d *Deployment) error {
 	return nil
 }
 
-func pipeline(d *Deployment) error {
-	// Validate everything that ends up in a path or a command argument.
-	if !shaPattern.MatchString(d.CommitSHA) {
-		return fmt.Errorf("invalid commit SHA %q: must be 40 lowercase hex characters", d.CommitSHA)
-	}
-	if err := ValidateRepoURL(d.RepoURL, d.AllowLocalRepo); err != nil {
-		return err
-	}
-
-	ctx := context.Background()
-
-	// Fail fast if Docker or the proxy is broken, before spending time on a
-	// build. This also creates sling-net, which the app container joins.
+// prepare fails fast if Docker or the proxy is broken, before any real work.
+// It also creates sling-net, which the app container joins.
+func prepare(ctx context.Context, d *Deployment) error {
 	d.SetStatus(StatusPreparing)
 	if err := proxy.Ensure(ctx); err != nil {
 		return fmt.Errorf("proxy setup failed: %w", err)
 	}
+	return nil
+}
 
-	containerName := fmt.Sprintf("app-%s", d.CommitSHA)
-	upstream := fmt.Sprintf("%s:%s", containerName, proxy.AppPort)
-
-	// Read what is live now, before touching any container. deployMu is held
-	// for the whole pipeline, so this cannot change underneath us. Redeploying
-	// the live commit is refused: the "docker rm -f" below would kill the
-	// container that is serving traffic.
+// liveUpstream is what the proxy serves now ("" = nothing, the 503 page).
+func liveUpstream(ctx context.Context) (string, error) {
 	prev, err := proxy.CurrentUpstream(ctx)
 	if err != nil {
-		return fmt.Errorf("could not read current upstream: %w", err)
+		return "", fmt.Errorf("could not read current upstream: %w", err)
 	}
-	if prev == upstream {
-		return fmt.Errorf("%s: %w", d.CommitSHA, ErrAlreadyLive)
-	}
-	d.PreviousUpstream = prev
+	return prev, nil
+}
 
+// refuseIfLive returns ErrAlreadyLive when sha is what the proxy serves now.
+func refuseIfLive(ctx context.Context, sha string) error {
+	prev, err := liveUpstream(ctx)
+	if err != nil {
+		return err
+	}
+	if prev == upstreamFor(sha) {
+		return fmt.Errorf("%s: %w", sha, ErrAlreadyLive)
+	}
+	return nil
+}
+
+func containerFor(sha string) string { return "app-" + sha }
+func upstreamFor(sha string) string  { return containerFor(sha) + ":" + proxy.AppPort }
+func imageFor(sha string) string     { return "paas-app:" + sha }
+
+// build turns d.CommitSHA into the image paas-app:<sha> and sets d.ImageTag.
+// Nothing here touches the proxy or a running container.
+func build(d *Deployment) error {
 	buildDir := filepath.Join(os.TempDir(), "paas-builds", d.CommitSHA)
-	d.ImageTag = fmt.Sprintf("paas-app:%s", d.CommitSHA)
-
 	_ = os.RemoveAll(buildDir)
 	// The image holds everything the app needs; the checkout is only an
-	// input to docker build. Remove it however the deploy ends.
+	// input to docker build. Remove it however the build ends.
 	defer removeBuildDir(buildDir)
 
 	d.SetStatus(StatusCloning)
@@ -95,14 +138,43 @@ func pipeline(d *Deployment) error {
 		return fmt.Errorf("checked-out commit %s does not match requested %s", head, d.CommitSHA)
 	}
 
+	tag := imageFor(d.CommitSHA)
 	d.SetStatus(StatusBuilding)
-	fmt.Printf("Building Docker image %s...\n", d.ImageTag)
-	if err := run.Streamed(buildTimeout, buildDir, "docker", "build", "-t", d.ImageTag, "."); err != nil {
+	fmt.Printf("Building Docker image %s...\n", tag)
+	if err := run.Streamed(buildTimeout, buildDir, "docker", "build", "-t", tag, "."); err != nil {
 		return fmt.Errorf("docker build failed: %w", err)
 	}
+	d.ImageTag = tag
+	return nil
+}
+
+// release makes the existing image d.ImageTag live without downtime: start a
+// fresh container, check it directly, switch the proxy, check through the
+// proxy, watch a grace window, and roll back if any post-cutover check fails.
+// It must run under the deploy lock.
+func release(ctx context.Context, d *Deployment) error {
+	if d.ImageTag != imageFor(d.CommitSHA) {
+		return fmt.Errorf("release: image %q does not match commit %s", d.ImageTag, d.CommitSHA)
+	}
+	containerName := containerFor(d.CommitSHA)
+	upstream := upstreamFor(d.CommitSHA)
+
+	// Read what is live right before acting on it. Redeploying the live
+	// commit is refused: the "docker rm -f" below would kill the container
+	// that is serving traffic.
+	prev, err := liveUpstream(ctx)
+	if err != nil {
+		return err
+	}
+	if prev == upstream {
+		return fmt.Errorf("%s: %w", d.CommitSHA, ErrAlreadyLive)
+	}
+	d.PreviousUpstream = prev
 
 	d.SetStatus(StatusStarting)
 	fmt.Printf("Starting container on dynamic host port...\n")
+	// Always a fresh container from the image: removes leftovers from a
+	// failed attempt, and (for a rollback) the stopped old container.
 	_, _ = run.Capture(cleanupTimeout, "", "docker", "rm", "-f", containerName)
 
 	// If anything below fails, don't leave a running container behind.

@@ -65,8 +65,9 @@ var (
 	// back from Caddy is checked against this before it reaches docker.
 	upstreamPattern = regexp.MustCompile(`^(app-[0-9a-f]{40}):` + proxy.AppPort + `$`)
 
-	// One deploy at a time. There is a single app for now; multiple apps
-	// will turn this into a per-app lock.
+	// One deploy at a time inside this process. The file lock in lock.go
+	// extends that to every Sling process on the host. There is a single
+	// app for now; multiple apps will turn both into per-app locks.
 	deployMu sync.Mutex
 
 	// After cutover the check goes through the proxy, so it is shorter: the
