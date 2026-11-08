@@ -1,6 +1,9 @@
 # Sling
 
 [![CI](https://github.com/mildlybrutal/sling-orchestrator/actions/workflows/main.yaml/badge.svg)](https://github.com/mildlybrutal/sling-orchestrator/actions/workflows/main.yaml)
+[![Website](https://img.shields.io/badge/website-sling--tawny.vercel.app-2a64f6)](https://sling-tawny.vercel.app/)
+
+<a href="https://sling-tawny.vercel.app/"><img src="docs/site.jpg" width="100%" alt="Sling's website: the headline 'Zero-downtime deploys for one VPS' over a terminal running a deploy"></a>
 
 **Push a commit, and it goes live with no downtime or rolls itself back.**
 Sling is a small self-hosted deploy orchestrator written in Go. You give it a git
@@ -11,6 +14,15 @@ watching. If anything fails along the way, traffic goes back to the previous ver
 ```
 go run ./cmd/sling https://github.com/you/app <40-char-commit-sha>
 ```
+
+<p align="center">
+  <img src="docs/demo.svg" width="100%" alt="A recorded terminal: Sling deploys a good commit, which goes live; a commit that crashes on boot fails before it gets traffic; a commit whose health checks start failing after the switch is rolled back during the grace window. curl shows v1 still serving after each failure, and sling history lists all three.">
+</p>
+
+<sub>A real run of <a href="scripts/demo.sh"><code>scripts/demo.sh</code></a>: a good deploy, a crash
+on boot that never gets traffic, and a release that goes live, starts failing and is rolled back
+on its own. Pauses are shortened so the 30s grace window plays in about two seconds. The
+durations Sling prints are real. Read <a href="docs/DESIGN.md">why it works this way</a>.</sub>
 
 ---
 
@@ -459,7 +471,14 @@ good versions, to exercise every path above.
 make test                                   # unit tests with -race (no Docker needed)
 make test-integration CADDY=/path/to/caddy  # against a real Caddy binary
 make e2e                                    # end to end: deploys every demo case with Docker
+make demo                                   # the README recording: good deploy, crash, automatic rollback
 ```
+
+`make demo` records [`scripts/demo.sh`](scripts/demo.sh) with
+[`scripts/record.py`](scripts/record.py) (Python's `pty`, no other tools) and draws
+[`docs/demo.svg`](docs/demo.svg) with [`scripts/cast2svg.py`](scripts/cast2svg.py).
+It needs the demo app's `fails-later` tag: a commit whose `/health` passes at first and
+returns 500 ten seconds after boot, so the release goes live and then has to be rolled back.
 
 ## Roadmap
 

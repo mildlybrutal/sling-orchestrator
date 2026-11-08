@@ -128,8 +128,21 @@ func (d *Deployment) SetStatus(s Status) {
 	d.history = append(d.history, StatusChange{Status: s, At: now})
 	info := d.infoLocked()
 	d.mu.Unlock()
+	persist(info)
+}
 
-	// Outside d.mu: a slow disk must not block readers of this deployment.
+// save writes the deployment's current state to the history without a status
+// change: for an error attached after the final status was set (a rollback).
+func (d *Deployment) save() {
+	if d.ID() == "" {
+		return // never recorded, nothing to update
+	}
+	persist(d.Info())
+}
+
+// persist hands info to the recorder. Called outside d.mu: a slow disk must
+// not block readers of this deployment.
+func persist(info Info) {
 	if r := currentRecorder(); r != nil {
 		if err := r.Save(info); err != nil {
 			fmt.Printf("⚠️  could not save deploy history: %v\n", err)

@@ -84,6 +84,10 @@ func locked(d *Deployment, fn func(ctx context.Context) error) error {
 			d.SetStatus(StatusSkipped)
 		case s != StatusRolledBack:
 			d.SetStatus(StatusFailed)
+		default:
+			// rollback() set rolled_back before the error existed: save
+			// again so the history keeps why it rolled back.
+			d.save()
 		}
 		return err
 	}
