@@ -22,7 +22,7 @@ go run ./cmd/sling https://github.com/you/app <40-char-commit-sha>
 <sub>A real run of <a href="scripts/demo.sh"><code>scripts/demo.sh</code></a>: a good deploy, a crash
 on boot that never gets traffic, and a release that goes live, starts failing and is rolled back
 on its own. Pauses are shortened so the 30s grace window plays in about two seconds. The
-durations Sling prints are real. Read <a href="docs/DESIGN.md">why it works this way</a>.</sub>
+durations Sling prints are real.</sub>
 
 ---
 
